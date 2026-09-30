@@ -1,0 +1,126 @@
+# Git attributes for line endings and file type handling
+
+# Set line endings to LF for all files
+* text eol=lf
+
+# Set binary files as binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.svg binary
+*.pdf binary
+*.zip binary
+*.tar binary
+*.gz binary
+
+# Set executable files as executable
+*.sh executable
+*.py executable
+*.js executable
+*.sh executable
+
+# Set specific file types
+*.md text
+*.txt text
+*.json text
+*.yaml text
+*.yml text
+*.xml text
+*.html text
+*.css text
+*.js text
+*.ts text
+*.py text
+*.java text
+*.cpp text
+*.c text
+*.h text
+*.hpp text
+*.go text
+*.rs text
+*.php text
+*.rb text
+*.pl text
+*.sql text
+*.sh text
+*.bat text
+*.cmd text
+
+# Set specific file types as binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.svg binary
+*.pdf binary
+*.zip binary
+*.tar binary
+*.gz binary
+*.7z binary
+*.rar binary
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.mp3 binary
+*.mp4 binary
+*.avi binary
+*.mov binary
+*.wav binary
+*.flac binary
+*.ogg binary
+
+# Set specific file types as text with specific line endings
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.xml text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.js text eol=lf
+*.ts text eol=lf
+*.py text eol=lf
+*.java text eol=lf
+*.cpp text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.hpp text eol=lf
+*.go text eol=lf
+*.rs text eol=lf
+*.php text eol=lf
+*.rb text eol=lf
+*.pl text eol=lf
+*.sql text eol=lf
+*.sh text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Set specific file types as binary with specific line endings
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.svg binary
+*.pdf binary
+*.zip binary
+*.tar binary
+*.gz binary
+*.7z binary
+*.rar binary
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.mp3 binary
+*.mp4 binary
+*.avi binary
+*.mov binary
+*.wav binary
+*.flac binary
+*.ogg binary
