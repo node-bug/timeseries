@@ -1,0 +1,11 @@
+numpy>=1.24.0
+pandas>=1.5.0
+stumpy>=1.13.0
+
+[app]
+yfinance>=0.2.36
+streamlit>=1.28.0
+plotly>=5.18.0
+
+[dev]
+pytest>=7.0

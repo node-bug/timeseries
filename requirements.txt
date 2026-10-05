@@ -1,0 +1,13 @@
+# Core -- stumpy is required (PLAN.md §C Stage 1 matrix profile) and needs Python 3.10+.
+numpy>=1.24.0
+pandas>=1.5.0
+stumpy>=1.13.0
+
+# Data acquisition and the Streamlit dashboard (not needed for the library or tests).
+yfinance>=0.2.36
+# 1.56.0 is the floor because the Price tab's pannable chart needs `st.iframe`, which
+# took a URL in `st.components.v1.iframe` -- passing it a document silently rendered an
+# empty panel. See the call site in app.py.
+streamlit>=1.56.0
+plotly>=5.18.0
+pytest>=7.0

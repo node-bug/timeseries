@@ -1,0 +1,47 @@
+# Streamlit app configuration.
+#
+# `server.enableStaticServing` serves the app's `static/` directory over HTTP. The Price
+# tab's lower chart is a custom iframe component that loads plotly.js from that
+# directory, so without this the script 404s into Streamlit's SPA shell (an HTML
+# document served with a 200) and the panel renders as an empty box -- the second chart
+# silently disappears. The vendored bundle is ~4.8 MB, comfortably under Streamlit's
+# 1 GB folder cap and 200 MB per-file cap, so serving it stays enabled.
+#
+# Files are served under `/app/static/<filename>`, not `/static/<filename>`.
+[server]
+enableStaticServing = true
+
+# The port is pinned here rather than passed as `--server.port` on the command line so
+# that it has exactly one definition. Streamlit's default is 8501, which any other
+# Streamlit app on this machine will also try to claim; two apps on one machine means
+# the second silently takes 8502 and every bookmark and task referencing a fixed port
+# points somewhere else. This file is the single source of truth: the `streamlit`
+# task in `.vscode/tasks.json` runs `streamlit run app.py` with no port flag.
+#
+# If this port is busy, Streamlit falls back to a random one and prints the URL it
+# actually bound to -- so the terminal output, not this file, is always the final word.
+port = 8599
+
+# Do not open a browser on launch. This is a headless dev box driven over the network
+# URL, and the auto-open steals focus from the editor.
+headless = true
+
+# There is deliberately no `[theme]` section here.
+#
+# The ticker input and its **Fetch** button sit side by side on the Price and Forecast
+# tabs, and Streamlit 1.65 renders a base button 4px taller than a base text input
+# (40px vs 36px), so their top edges differ by ~2px even when correctly aligned. That
+# would be the natural thing to fix with a theme option such as `baseButtonHeight`.
+#
+# There is not one. Verified against the installed package rather than assumed --
+# `streamlit.config` declares no button-height option, so adding the key is accepted
+# silently and does nothing:
+#
+#     'baseButtonHeight' in inspect.getsource(streamlit.config)  ->  False
+#
+# The same goes for a CSS rule in `app.py`: Streamlit sanitises `<style>` passed to
+# `st.markdown(unsafe_allow_html=True)`, and a `[data-testid="stButton"] button
+# {height: 2.375rem}` rule added to `HELP_CSS` was measured to have **no effect** on
+# the rendered DOM. The 2px is therefore left alone rather than worked around with
+# another hard-coded nudge -- see the note in `render_ticker_input`, where the 25px gap
+# that *was* a real bug is fixed.

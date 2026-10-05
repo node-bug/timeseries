@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<script src="plotly.min.js" charset="utf-8"></script>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; }
+  #chart { width: 100%; height: 100%; }
+  /* Suppress text selection while dragging so a drag that leaves the plot does not
+     rubber-band a selection. We must NOT set `pointer-events: none` on #chart -- that
+     would cancel plotly's drag outright, and pan has to survive the pointer leaving. */
+  body.dragging { user-select: none; -webkit-user-select: none; }
+</style>
+</head>
+<body>
+<div id="chart"></div>
+<script>
+/*
+ * A plotly chart whose horizontal pan HARD STOPS at the configured bounds.
+ *
+ * Why this exists
+ * ---------------
+ * `xaxis.minallowed`/`maxallowed` do not stop a pan. plotly.js treats them as limits on
+ * the *range*, and once a drag passes one it switches to zooming instead of refusing --
+ * documented behaviour, and plotly/plotly.js#887 ("Why can't you just stop the panning
+ * during the drag when the axis reaches maxallowed?") is still open. So a reader chasing
+ * the edge of a window sees the chart silently zoom, which changes how many bars are
+ * visible and breaks any comparison the reader was making.
+ *
+ * The fix is to enforce the limit on every relayout rather than trusting the axis
+ * attribute: whatever range the drag produces, clamp it back into the legal band and
+ * re-apply. The drag therefore stops dead at the edge and never zooms.
+ *
+ * The bound applies to each end of the resulting range -- `min` clamps the left edge and
+ * `max` clamps the right edge -- because that is what the numbers mean. Clamping only one
+ * is what produced an earlier bug here, where the chart was truncated to a fraction of its
+ * width and the scored band sat off the right of the screen.
+ */
+
+function clamp(v, lo, hi) {
+  if (v == null || isNaN(v)) return null;
+  return Math.min(hi, Math.max(lo, v));
+}
+
+/* The width the chart is currently allowed to show, captured when the plot is built.
+   A reader who has zoomed changes the live range; we keep whatever width they had and
+   only ever refuse to go *below* the width the chart opened at. */
+function enforce(gd) {
+  if (!gd || !gd.layout || !gd.layout.xaxis) return;
+  var xa = gd.layout.xaxis;
+  var minAllowed = xa.minallowed, maxAllowed = xa.maxallowed;
+  if (minAllowed == null || maxAllowed == null) return;
+
+  var r = xa.range;
+  if (!r || (r[0] == null && r[1] == null)) return;
+  var lo = (r[0] == null) ? minAllowed : r[0];
+  var hi = (r[1] == null) ? maxAllowed : r[1];
+
+  var width = hi - lo;
+  var clo = clamp(lo, minAllowed, maxAllowed);
+  var chi = clamp(hi, minAllowed, maxAllowed);
+
+  /* If one edge was pushed in, take the same number of bars out of the other edge.
+     This is what turns "pan past the edge" into "pan stops at the edge" instead of
+     "the chart squashes" -- the visible width is preserved. Each branch then re-clamps
+     the edge it moved, because the shift can push it straight through the *other*
+     limit: a far over-drag right clamps `lo` up to maxAllowed, and adding the width to
+     that would put `chi` well past the end of the data. */
+  if (clo !== lo) {
+    chi = clo + width;
+    if (chi > maxAllowed) {
+      chi = maxAllowed;
+      clo = chi - width;
+    }
+  } else if (chi !== hi) {
+    clo = chi - width;
+    if (clo < minAllowed) {
+      clo = minAllowed;
+      chi = clo + width;
+    }
+  }
+
+  /* Never let the window shrink below the width it opened at: that is the zoom the
+     reader did not ask for, and it is the failure this component exists to prevent. */
+  var floor = gd._minSpan || 0;
+  if (floor > 0 && chi - clo < floor - 0.5) {
+    // Prefer anchoring to an edge that is still legal, then pin to the bounds.
+    if (clo >= minAllowed - 0.5 && clo + floor <= maxAllowed + 0.5) {
+      chi = clo + floor;
+    } else if (chi <= maxAllowed + 0.5 && chi - floor >= minAllowed - 0.5) {
+      clo = chi - floor;
+    } else {
+      clo = minAllowed;
+      chi = maxAllowed;
+    }
+  }
+
+  /* Last resort: the width cannot fit between the bounds at all. Showing the full legal
+     span is wrong too, but it is *in bounds* and recoverable; the alternative is a
+     window sitting outside the data the reader can reach. */
+  if (chi - clo > maxAllowed - minAllowed + 0.001) {
+    clo = minAllowed;
+    chi = maxAllowed;
+  }
+
+  if (clo !== r[0] || chi !== r[1]) {
+    Plotly.relayout(gd, { 'xaxis.range': [clo, chi] });
+  }
+}
+
+window.renderChart = function (fig, height) {
+  var el = document.getElementById('chart');
+  el.style.height = (height || 560) + 'px';
+
+  // If plotly never loaded, everything below throws on `Plotly.newPlot` and the panel
+  // is left as an empty box -- indistinguishable, to the reader, from a bug in the
+  // figure. Say so in words instead. The usual cause is the script being served
+  // Streamlit's HTML shell rather than JavaScript (a wrong path, or
+  // `server.enableStaticServing` off), which fails silently at the network layer.
+  if (typeof Plotly === 'undefined') {
+    el.innerHTML =
+      '<div style="padding:12px;font:14px system-ui,sans-serif;color:#b3261e">' +
+      'plotly.js did not load, so this chart cannot be drawn. Check that ' +
+      'server.enableStaticServing is enabled and static/plotly.min.js is served.</div>';
+    return;
+  }
+
+  var spec = fig;
+  var layout = spec.layout || {};
+  var xa = layout.xaxis || {};
+  var opening = xa.range;
+
+  Plotly.newPlot(el, spec.data, layout, spec.config || {}).then(function (gd) {
+    // The width the chart opened at, which no drag is allowed to reduce.
+    if (opening && opening[0] != null && opening[1] != null) {
+      gd._minSpan = opening[1] - opening[0];
+    }
+    // `plotly_relayout` fires after the axis has changed, so this sees the offending
+    // range and puts it back.
+    gd.on('plotly_relayout', function () { enforce(gd); });
+    enforce(gd);
+  });
+
+  document.body.classList.add('dragging');
+  document.addEventListener('mouseup', function () {
+    document.body.classList.remove('dragging');
+  });
+};
+</script>
+</body>
+</html>
