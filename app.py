@@ -674,6 +674,11 @@ def forecast_recent_key() -> str:
     """Widget key for the recent-bars control, namespaced by resolution."""
     return state_key(FORECAST_RECENT_KEY)
 
+
+def projection_recent_key() -> str:
+    """Widget key for the projection recent-bars control, namespaced by resolution."""
+    return state_key(FORECAST_RECENT_KEY)
+
 # Streamlit widget key for the Price tab's brushable chart.  Declared here because the
 # selection event is read *before* the chart that writes it is rendered -- see the
 # "Brush on the Price tab's own chart" block in ``main()`` -- so the reader cannot
@@ -831,6 +836,9 @@ PRICE_TICKER_FETCH_KEY = "ticker_fetch_price"
 FORECAST_TICKER_KEY = "active_ticker_forecast"
 FORECAST_TICKER_INPUT_KEY = "ticker_input_forecast"
 FORECAST_TICKER_FETCH_KEY = "ticker_fetch_forecast"
+PROJECTION_TICKER_KEY = "active_ticker_projection"
+PROJECTION_TICKER_INPUT_KEY = "ticker_input_projection"
+PROJECTION_TICKER_FETCH_KEY = "ticker_fetch_projection"
 
 # The resolution is **session-level**, not per-scope: see
 # :data:`SESSION_TIMEFRAME_KEY`.  There are deliberately no ``*_TIMEFRAME_INPUT_KEY``
@@ -882,6 +890,8 @@ FORECAST_STALE_KEYS: Tuple[str, ...] = (
     FORECAST_SELECTION_KEY, FORECAST_BRUSH_KEY,
     FORECAST_RUN_KEY, FORECAST_APPLIED_KEY,
 )
+
+PROJECTION_STALE_KEYS: Tuple[str, ...] = ()
 
 # Timezone the trading sessions are grouped in.  A US equity session runs 09:30-16:00
 # ET, so it is named by its *Eastern* date -- a 09:30 winter open is 14:30 UTC and
@@ -941,7 +951,7 @@ CHANNEL_LABELS = FEATURE_COLUMNS
 # of those keys at once and discard every reader's brush, settings and last run on
 # deploy, for no behaviour change.  A future reader who finds ``FORECAST_BRUSH_KEY``
 # "mislabelled" against the *Forecast* tab should leave it alone.
-TAB_ORDER = ("Price", "Matches", "Projection", "Forecast", "Panel", "Quality",
+TAB_ORDER = ("Projection", "Price", "Matches", "Forecast", "Panel", "Quality",
              "Backtest")
 
 # How much tape the Price tab shows, in trading sessions.
@@ -964,12 +974,12 @@ DEFAULT_VIEW_DAYS = 5
 # The tab the page opens on, passed to ``st.tabs(default=...)``.
 #
 # This is redundant with ``TAB_ORDER[0]`` today, and that redundancy is the point.
-# "Price leads" is a *behavioural* claim the whole app's help copy makes ("this is
-# where the app opens"), so it is stated as an explicit default rather than left to
+# "Projection leads" is a *behavioural* claim the whole app's help copy makes ("this
+# is where the app opens"), so it is stated as an explicit default rather than left to
 # fall out of tuple order.  Streamlit falls back to the first tab when ``default`` is
 # ``None``, which means a reordering of ``TAB_ORDER`` would silently change the
 # landing view and break that promise with nothing in the diff to explain it.
-DEFAULT_TAB = "Price"
+DEFAULT_TAB = "Projection"
 
 # ``st.tabs`` only *registers a widget* -- and only reads its selection from
 # ``session_state`` -- when ``on_change`` is passed (Streamlit sets
@@ -3245,6 +3255,256 @@ def _closest_match_path(close: np.ndarray, path: Any) -> Optional[np.ndarray]:
     return (window / base - 1.0) * 100.0
 
 
+def build_forecast_path_figure_price(
+    pipe: Pipeline,
+    path: Any,
+    *,
+    history_bars: Optional[int] = None,
+    height: int = 420,
+    title: Optional[str] = None,
+    window: Optional[Tuple[int, int]] = None,
+) -> go.Figure:
+    """A window of real tape, then the projected path in actual prices.
+
+    Three things are drawn, and the order matters:
+
+    1. the **history**, as a plain close line on the app's usual blue;
+    2. the **interquartile band**, as two boundary traces joined by ``fill``;
+    3. the **median**, as the line a reader actually follows.
+
+    Unlike ``build_forecast_path_figure``, this function shows actual prices
+    rather than percentage changes from the anchor point.
+
+    **``window`` says which window is drawn.**  It is ``None`` for the reference chart,
+    whose history is the archive's last ``history_bars`` bars.  For the brushed chart
+    it is the span the reader drew, and it changes two things:
+
+    * the history is *that* window rather than the archive's tail -- otherwise a
+      reader who brushed a window in the middle of the archive would be shown a chart
+      of some other window's price action under a caption describing theirs;
+    * the projection is anchored at the window's end, so it starts where the window
+      ended instead of trailing off from the end of the archive.  This is the whole
+      point of the brushed chart: "what followed *this*".
+
+    ``history_bars`` is ignored when ``window`` is given, since the window's own width
+    is the history.  It stays for the unbrushed caller, where the window *is* the tail.
+
+    Bars sit on their integer index with session gaps compressed, matching
+    :func:`build_price_figure`.  The projection therefore *does* cross an overnight
+    close on an equity, and that is fine for spacing but not for labels: every tick
+    right of the boundary is stamped as an *offset* (``+45 min``, or ``+4 days`` on
+    daily -- resolved by :func:`bar_unit`) rather than a timestamp, because those bars
+    do not exist yet and printing a time for them would be the chart asserting
+    something it has no data for.
+
+    ``title`` is passed in rather than read from ``SYMBOL_FOR_HELP`` here, matching
+    :func:`render_price_tab`'s handling of the Price chart's title: the renderer
+    resolves the live symbol and the figure stays a pure function of its arguments.
+
+    **Four traces, in draw order: history, band upper, band lower, median, closest
+    match.**  The median is drawn before the closest match so the individual window
+    sits *on top* of the aggregate -- legible without displacing it.  The band pair
+    stays adjacent, because ``fill="tonexty"`` binds the lower boundary to whichever
+    trace precedes it, and inserting anything between them would shade the wrong
+    region.
+
+    **The closest match is omitted, not faked, when it cannot be reconstructed.**
+    :func:`_closest_match_path` returns ``None`` for every way that can happen and the
+    median is drawn regardless, so a missing evidence line can never cost the reader
+    the aggregate answer.
+    """
+    n = pipe.n_bars
+    if history_bars is None:
+        history_bars = _tf().forecast_history_bars
+    # ``anchor`` is the last bar of real tape on the chart -- the bar the projection
+    # grows out of.  Everything else is expressed relative to it.
+    if window is None:
+        hist = max(1, min(int(history_bars), n))
+        hist_start = n - hist
+    else:
+        hist_start, hist_stop = int(window[0]), int(window[1])
+        if not (0 <= hist_start < hist_stop <= n):
+            hist_start, hist_stop = max(0, min(hist_start, n - 1)), n
+        hist = hist_stop - hist_start
+    anchor = hist_start + hist - 1
+    stop = anchor + 1 + int(path.horizon)
+
+    close = np.asarray(pipe.close, dtype=float)
+
+    hist_x = np.arange(hist_start, hist_start + hist, dtype=np.int64)
+    hist_y = close[hist_start:hist_start + hist]
+
+    # The projection is anchored on that same bar, so offset 0 -- which
+    # ``forecast_paths`` guarantees is exactly 0.0 -- lands on the same x as the
+    # final history bar.  That shared point is what makes the join seamless.
+    proj_x = anchor + 1 + np.asarray(path.offsets, dtype=np.int64)
+
+    # For the projection values, we need to convert from percentage offsets to actual prices
+    # The median/quartiles in path are percentages, so we need to apply them to the anchor price
+    base_price = float(close[anchor]) if 0 <= anchor < n else float("nan")
+    if not np.isfinite(base_price) or base_price <= 0:
+        base_price = 1.0  # fallback to avoid division by zero
+    
+    # Convert percentage values to actual prices
+    median_prices = base_price * (1.0 + path.median / 100.0)
+    q25_prices = base_price * (1.0 + path.q25 / 100.0)
+    q75_prices = base_price * (1.0 + path.q75 / 100.0)
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=hist_x, y=hist_y, mode="lines",
+        line=dict(color="#1f77b4", width=1.3),
+        name="history (last %d bars)" % hist,
+        hovertemplate="%{x}<br>$%{y:.2f}<extra>history</extra>",
+    ))
+
+    # Band as a ``tonexty`` pair: the upper boundary is drawn first and the lower
+    # one fills to it.  There is no gap being spanned here, so unlike the rolling-band
+    # case in ``build_price_figure`` one polygon over the whole projection is enough.
+    fig.add_trace(go.Scatter(
+        x=proj_x, y=q75_prices, mode="lines",
+        line=dict(width=0), showlegend=False, hoverinfo="skip",
+        name="upper quartile",
+    ))
+    fig.add_trace(go.Scatter(
+        x=proj_x, y=q25_prices, mode="lines",
+        line=dict(width=0), fill="tonexty",
+        fillcolor="rgba(44,160,44,0.18)",
+        showlegend=False, hoverinfo="skip",
+        name="interquartile range",
+    ))
+    fig.add_trace(go.Scatter(
+        x=proj_x, y=median_prices, mode="lines",
+        line=dict(color="#2ca02c", width=2),
+        name="median of %d matches" % path.n_matches,
+        hovertemplate="%{x}<br>$%{y:.2f}<extra>projected</extra>",
+    ))
+
+    # **The single closest match, as its own line.**  The median above is an
+    # aggregate: it says what usually happened, and on its own it hides the fact that
+    # "usually" may be a compromise between windows that went opposite ways.  The
+    # best match is the one concrete instance behind the aggregate, and drawing it
+    # costs one trace and makes the median auditable -- a reader who wants to know
+    # whether the band is narrow because the evidence agreed or because the
+    # aggregation smoothed it can now see a single window it can check against the
+    # chart above.
+    #
+    # **Rebuilt from ``close`` rather than carried on the path**, because
+    # ``ForecastPath`` stores only the median and the quartiles: it keeps ``starts``
+    # and ``distances`` for attribution, not the individual return series.  Reconstructing
+    # it here is exact -- the same slice and the same rebasing ``forecast_paths``
+    # applies -- so the line is the real forward path of that window, not an
+    # approximation of it.
+    #
+    # **The distance is drawn, not implied.**  A single window is an anecdote, and the
+    # whole point of the §E framing is that the best-looking of thousands is extreme
+    # by construction.  Labelling it "closest match" without its distance would invite
+    # reading it as the expected outcome, which is precisely the misreading the median
+    # exists to prevent; the number is in the trace name so the reader can weigh it.
+    #
+    # **Drawn last and dashed**, so it sits above the band without competing with the
+    # median for attention: the median is the claim, this is the evidence for it.
+    best = _closest_match_path(pipe.close, path)
+    if best is not None:
+        # Convert closest match from percentage to actual prices
+        best_prices = base_price * (1.0 + np.asarray(best) / 100.0)
+        fig.add_trace(go.Scatter(
+            x=proj_x, y=best_prices, mode="lines",
+            line=dict(color="#ff7f0e", width=1.5, dash="dot"),
+            name="closest match (distance %s)" % (
+                _closest_distance_label(path)),
+            hovertemplate="%{x}<br>$%{y:.2f}<extra>closest match</extra>",
+        ))
+
+    # The boundary, drawn before the shading so the shading does not wash it out.
+    fig.add_vline(x=anchor, line=dict(color="rgba(128,128,128,0.9)", width=1.4,
+                                      dash="dash"))
+    fig.add_vrect(
+        x0=anchor, x1=stop - 0.5,
+        fillcolor="rgba(128,128,128,0.10)", line_width=0, layer="below",
+    )
+
+    # Ticks: real timestamps across the history, projected offsets across the future.
+    step = max(1, hist // 8)
+    ticks = list(range(hist_start, hist_start + hist, step))
+    if not ticks or ticks[-1] != hist_start + hist - 1:
+        ticks.append(hist_start + hist - 1)
+    pstep = max(1, int(path.horizon) // 5)
+    proj_ticks = list(range(0, int(path.horizon) + 1, pstep))
+    if proj_ticks and proj_ticks[-1] != int(path.horizon):
+        proj_ticks.append(int(path.horizon))
+
+    tickvals = ticks + [anchor + 1 + o for o in proj_ticks]
+    # **The unit is the resolution's, not a literal.**  These offsets are *bars*, so
+    # on daily a tick reads "+4 days", not "+4 min" -- one bar is one trading day there.
+    # Labelling them in minutes was a wrong number printed straight onto a chart, which
+    # is the failure the ``[[GAP]]`` token and the rest of this app's resolution
+    # handling exist to prevent; the Backtest tab's own *Horizon* help already resolves
+    # its unit through :func:`active_unit` for exactly this reason.
+    #
+    # Read from ``_tf()`` rather than from the figure's caller, because the figure
+    # renders under whichever resolution the *containing* tab is in -- the Forecast tab
+    # may hold a different one from the Price tab, and this axis describes the bars it
+    # was handed, not the ones the page opened on.  The *history* labels therefore come
+    # from the pipeline, which is the authority on the bars actually drawn; only the
+    # projected offsets, which have no pipeline behind them, use the active timeframe.
+    ticktext = [
+        stamp_label(pipe.bars["timestamp"].iloc[i], key=pipe.timeframe) for i in ticks
+    ] + ["+%d %s" % (o, bar_unit(o)) for o in proj_ticks]
+
+    fig.add_hline(y=0.0, line=dict(color="rgba(128,128,128,0.45)", width=1, dash="dot"))
+
+    # Constrain the y-axis to the projection's price range so the forecast fills the
+    # chart instead of being squashed at the top.  The history is drawn in the same
+    # units, but its full range is not what the reader is looking at: they are
+    # reading the projection, so the axis should be sized around it.  The history is
+    # still included when it stays close to the anchor, so the tape the reader just
+    # brushed is not clipped; if the window is long or volatile and its full range
+    # would squash the forecast back to the top, we keep the tighter range instead.
+    proj_prices = np.concatenate([
+        median_prices, q25_prices, q75_prices,
+        np.asarray(best_prices) if best is not None else [],
+    ])
+    proj_lo, proj_hi = proj_prices.min(), proj_prices.max()
+    proj_range = proj_hi - proj_lo
+    pad = proj_range * 0.15 if proj_range > 0 else 1.0
+
+    # Base range around the projection, with the anchor guaranteed visible
+    # (it is the join point between history and projection).
+    y_lo, y_hi = proj_lo - pad, proj_hi + pad
+    y_lo = min(y_lo, base_price)
+    y_hi = max(y_hi, base_price)
+
+    hist_min, hist_max = hist_y.min(), hist_y.max()
+    combined_lo, combined_hi = min(y_lo, hist_min), max(y_hi, hist_max)
+    combined_range = combined_hi - combined_lo
+    if combined_range > 0 and proj_range / combined_range >= 0.35:
+        y_lo, y_hi = combined_lo, combined_hi
+
+    fig.update_layout(
+        height=height,
+        margin=dict(l=64, r=8, t=46, b=54),
+        hovermode="x unified",
+        dragmode="pan",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        xaxis=dict(
+            title="bar index · sessions compressed · right of the dashed line is projected",
+            showgrid=True, gridcolor="rgba(128,128,128,0.15)", automargin=True,
+            tickmode="array", tickvals=tickvals, ticktext=ticktext,
+            range=[hist_start - 0.5, stop - 0.5],
+        ),
+        yaxis=dict(
+            title="price ($)",
+            showgrid=True, gridcolor="rgba(128,128,128,0.15)",
+            automargin=True,
+            range=[y_lo, y_hi],
+        ),
+        title=dict(text=title, font=dict(size=12)) if title else None,
+    )
+    return fig
+
+
 def build_forecast_path_figure(
     pipe: Pipeline,
     path: Any,
@@ -4013,71 +4273,50 @@ def _render_forecast_path(pipe: Pipeline, symbol: str, *, length: int, horizon: 
     caption an AAPL forecast as QQQ, and would also collide on ``forecast_path_for``'s
     cache key, serving one ticker's path against another's chart.
     """
+    # The percentage chart was removed; the actual-price projection is drawn on the
+    # Projection tab instead.  This function remains so the Forecast tab still
+    # computes the path (its cache key is used by the Projection tab) without
+    # rendering anything itself.
+    forecast_path_for(
+        symbol, pipe,
+        length=length, horizon=horizon, k=k,
+        amplitude_weight=amplitude_weight,
+    )
+
+
+def _render_forecast_path_price(
+    pipe: Pipeline, path: Any, symbol: str, *,
+    length: int, horizon: int, k: int, amplitude_weight: float,
+) -> None:
+    """The projection chart, drawn on the Projection tab.
+
+    Mirrors :func:`_render_forecast_path` but shows prices rather than percentage
+    offsets from the anchor, and is drawn on the Projection tab instead of Forecast.
+    """
     st.subheader("Where this usually goes next")
 
-    with st.spinner("Matching the most recent {} bars and aggregating…".format(length)):
-        path = forecast_path_for(
-            symbol, pipe,
-            length=length, horizon=horizon, k=k,
-            amplitude_weight=amplitude_weight,
-        )
-
-    if path is None:
-        st.warning(
-            "No forecast path could be built from the most recent **{}** bars of this "
-            "archive.".format(length)
-        )
-        hint(
-            "This chart matches the archive's own last window rather than the one you "
-            "brushed, and it needs every one of its {} matches to have **{} further "
-            "bars** of real history after it — the archive has to be long enough for "
-            "that. **What to try:** check the <b>Quality</b> tab for how many bars "
-            "loaded, or use a more liquid symbol, which returns more of the available "
-            "intraday history.".format(FORECAST_PATH_MATCHES, horizon)
-        )
-        return
-
-    fig = build_forecast_path_figure(
+    fig_price = build_forecast_path_figure_price(
         pipe, path, history_bars=length,
         title="%s · %d bars of history, %d projected from %d matches"
               % (symbol, length, path.horizon,
                  path.n_matches),
     )
-    st.plotly_chart(fig, width='stretch', key="forecast_path", config=chart_config())
+    st.plotly_chart(fig_price, width='stretch', key="forecast_path_price", config=chart_config())
 
     hint(
         "Left of the dashed line is real tape: the archive's most recent {} bars. "
         "Right of it is the <b>projection</b> — the median of where each of the {} "
-        "closest matching windows went over the following {} bars, each rebased to "
-        "its own final close. The green band is the middle half of those {} paths; "
+        "closest matching windows went over the following {} bars in actual price. "
+        "The green band is the middle half of those {} paths; "
         "a wide band means the matches disagreed, and that disagreement is the most "
         "useful thing on this chart.".format(
             length, path.n_matches, path.horizon, path.n_matches
         )
     )
-    hint(
-        "<b>This chart is deliberately independent of your brush.</b> It always asks "
-        "about the archive's own most recent {} bars and always uses {} matches, so it "
-        "stays put while you explore other windows on the <i>Price</i> tab. The "
-        "evidence table underneath it <i>is</i> about your query — the two answer "
-        "different questions and are not expected to agree.".format(
-            length, FORECAST_PATH_MATCHES
-        )
-    )
 
-    # The shortfall is stated rather than hidden.  ``forecast_paths`` drops matches
-    # with no forward history, which is always the most recent ones, so a count below
-    # the requested 30 is normal near the end of an archive -- but it is also exactly
-    # the situation where the median is least trustworthy, so the reader is told.
-    if path.n_matches < FORECAST_PATH_MATCHES:
-        st.warning(
-            "Only **{}** of the requested {} matches had {} further bars of history "
-            "after them, so this median is computed from fewer windows than "
-            "intended. Matches without a forward path are dropped rather than counted "
-            "as flat, so the curve is honest — but it is thinner than it looks."
-            .format(path.n_matches, FORECAST_PATH_MATCHES, path.horizon)
-        )
-
+    # The panel chart shares the same axes as the single-ticker chart, so it belongs
+    # with the actual-price projection on the Projection tab rather than with the
+    # percentage reference on Forecast.
     _render_panel_forecast_path(
         pipe, symbol, length=length, horizon=horizon, k=k,
         amplitude_weight=amplitude_weight,
@@ -4138,7 +4377,7 @@ def _render_panel_forecast_path(pipe: Pipeline, symbol: str, *, length: int,
         return
 
     ppath = bundle["path"]
-    fig = build_forecast_path_figure(
+    fig = build_forecast_path_figure_price(
         pipe, ppath,
         title="%s · %d bars, %d projected from %d matches across %d symbols"
               % (symbol, length, ppath.horizon, ppath.n_matches,
@@ -6395,6 +6634,30 @@ FETCH_SCOPES: Dict[str, Dict[str, str]] = {
             "bars from the session still in progress."
         ),
     },
+    "projection": {
+        "widget_label": "Projection ticker symbol",
+        "button_label": "Fetch projection bars",
+        "seed_scope": "price",
+        "help": (
+            "Any ticker Yahoo Finance accepts, fetched and cached exactly as the box "
+            "beside it is. Press **Fetch projection bars** to redraw the Projection "
+            "tab on it; nothing else on the page moves, and you stay on the tab you "
+            "are reading.\n\n"
+            "**This tab's ticker is its own.** It starts on whatever the Price "
+            "box holds, then keeps its own — so once you set it, changing Price "
+            "leaves it alone, and the two can show different instruments at "
+            "the same time. The resolution is shared by every tab and fixed for "
+            "the session; only reload the page to change it.\n\n"
+            "A symbol already fetched this session is reused from memory rather "
+            "than downloaded again, so pointing this at the Price ticker costs "
+            "nothing."
+        ),
+        "downloaded": (
+            "Downloading every {2} bar Yahoo has for {1} and charting them on the "
+            "Projection tab only. Press it again to pick up bars from the session "
+            "still in progress."
+        ),
+    },
 }
 
 
@@ -6443,7 +6706,10 @@ def _scope_keys(scope: str) -> Tuple[str, str]:
     """
     if scope == "price":
         return (PRICE_TICKER_KEY, PRICE_TICKER_INPUT_KEY)
-    return (FORECAST_TICKER_KEY, FORECAST_TICKER_INPUT_KEY)
+    elif scope == "forecast":
+        return (FORECAST_TICKER_KEY, FORECAST_TICKER_INPUT_KEY)
+    else:  # projection
+        return (PROJECTION_TICKER_KEY, PROJECTION_TICKER_INPUT_KEY)
 
 
 def resolve_ticker(scope: str) -> Optional[ResolvedScope]:
@@ -6823,8 +7089,15 @@ def reset_query_state(scope: str, symbol: str) -> None:
     brush, a text input -- leaves the generation alone, so it never yanks the reader
     back to Price while they are mid-analysis.
     """
-    ticker_key = PRICE_TICKER_KEY if scope == "price" else FORECAST_TICKER_KEY
-    stale = PRICE_STALE_KEYS if scope == "price" else FORECAST_STALE_KEYS
+    if scope == "price":
+        ticker_key = PRICE_TICKER_KEY
+        stale = PRICE_STALE_KEYS
+    elif scope == "forecast":
+        ticker_key = FORECAST_TICKER_KEY
+        stale = FORECAST_STALE_KEYS
+    else:  # projection
+        ticker_key = PROJECTION_TICKER_KEY
+        stale = PROJECTION_STALE_KEYS
 
     st.session_state["_"] = {}
     # The per-scope lists below are what actually discard state; the assignment above
@@ -7219,8 +7492,10 @@ def main() -> None:
     # not be able to stop the tape from being chartable.
     price_scope = resolve_ticker("price")
     forecast_scope = resolve_ticker("forecast")
+    projection_scope = resolve_ticker("projection")
     symbol = price_scope.symbol if price_scope is not None else None
     forecast_symbol = forecast_scope.symbol if forecast_scope is not None else None
+    projection_symbol = projection_scope.symbol if projection_scope is not None else None
 
     # **One resolution for both scopes, already published above the tab bar** by
     # ``session_timeframe``.  Read from there rather than off either scope, so the
@@ -7343,6 +7618,43 @@ def main() -> None:
                     "The Price, Matches, Quality and Backtest tabs are unaffected — "
                     "they are built from their own archive. Set a different symbol in "
                     "the input at the top of the <b>Forecast</b> tab to restore it."
+                )
+
+    # The Projection tab's own pipeline, over its own ticker.
+    #
+    # **A third pipeline, not a second copy of either.**  ``st.tabs`` renders every
+    # tab body on every rerun, so this is built unconditionally like the two above --
+    # but it is built from ``projection_symbol``, resolved at the top of this function,
+    # which is the Projection tab's instrument and is routinely not the Price or
+    # Forecast one.
+    #
+    # A failure here is **not** fatal to the page.  A thin or unreadable Projection
+    # ticker must not take the Price tape down with it, so this degrades to ``None``
+    # and the Projection tab says so; only a Price failure returns from ``main``.
+    projection_pipe: Optional[Pipeline] = None
+    projection_tf = forecast_tf
+    if not projection_symbol:
+        st.warning(
+            "No Projection ticker is in force, so the Projection tab is unavailable. "
+            "Enter a symbol in its own input at the top of the <b>Projection</b> tab."
+        )
+    else:
+        with st.spinner("Loading bars and building features…"):
+            try:
+                projection_bars = fetch_ticker_cached(projection_symbol,
+                                                        timeframe=projection_tf.key).frame
+                projection_pipe = pipeline_from_frame(
+                    "{}@{}".format(projection_symbol, projection_tf.key),
+                    projection_bars, active_length(), timeframe=projection_tf)
+            except Exception as exc:  # noqa: BLE001 - one tab's failure is not the page's
+                st.warning(
+                    "Could not build the Projection pipeline for {}: {}".format(
+                        projection_symbol, exc)
+                )
+                hint(
+                    "The Price, Matches, Quality and Backtest tabs are unaffected — "
+                    "they are built from their own archive. Set a different symbol in "
+                    "the input at the top of the <b>Projection</b> tab to restore it."
                 )
 
     # Help copy rendered on later passes must quote the grid actually in use, not the
@@ -7960,13 +8272,20 @@ def main() -> None:
             render_matches_tab(pipe, out["result"])
 
     with tab_projection:
-        # **No ticker input on this tab.**  It moved to *Forecast*, below, which is
-        # the tab that does the work.  An input may be registered on exactly one path
-        # per pass and ``st.tabs`` renders every body on every pass, so drawing it on
-        # both would raise ``StreamlitDuplicateElementKey`` and take down the page --
-        # the same failure the not-ready branch records, reached from the ready path.
-        # This tab charts whichever ticker is in force, so it still needs a gate: it
-        # just needs no control.
+        # **This tab's ticker input, at the top of its own body.**  The control that
+        # decides which instrument you are looking at sits directly above the charts
+        # it changes, so there is no separate "instrument picker" to keep mentally in
+        # sync with the tab you are reading.
+        #
+        # Drawn *before* ``guide("Projection")`` and above every chart, so it is the
+        # first thing on the tab rather than something below the fold.
+        render_scope_ticker(
+            "projection",
+            note="This tab's ticker is its own — it starts on whatever the "
+                 "<b>Price</b> tab holds, then keeps its own. Both it and <b>Forecast</b> "
+                 "chart it.",
+        )
+
         guide("Projection")
         # Called unconditionally, and it renders the projection before it consults
         # anything else at all.  The previous version short-circuited on ``out is
@@ -7975,27 +8294,46 @@ def main() -> None:
         # depend on the reader's window or on a search run, so that gate left the tab's
         # main visual permanently blank for anyone who had not pressed *Run match*.
         #
-        # **``forecast_pipe`` and ``forecast_symbol``, not ``pipe`` and ``symbol``.**
-        # This tab charts the Forecast instrument, and on a healthy pair these are two
+        # **``projection_pipe`` and ``projection_symbol``, not ``pipe`` and ``symbol``.**
+        # This tab charts the Projection instrument, and on a healthy pair these are two
         # different objects over two different archives.  Reading the Price pipeline
         # here would silently show a Forecast for the wrong ticker whenever the reader
         # set one -- and, because ``forecast_path_for`` is keyed on the symbol, it would
-        # serve the Price ticker's cached path under the Forecast ticker's title.
+        # serve the Price ticker's cached path under the Projection ticker's title.
         #
         # **Rendered before ``tab_forecast``**, which reads the projection horizon this
         # tab's slider resolves.
-        if forecast_pipe is None:
+        if projection_pipe is None:
             st.info(
-                "No Forecast ticker is loaded, so this tab has nothing to chart. Enter "
-                "a symbol on the <b>Forecast</b> tab and press **Fetch forecast "
+                "No Projection ticker is loaded, so this tab has nothing to chart. Enter "
+                "a symbol on the <b>Projection</b> tab and press **Fetch projection "
                 "bars**. Every other tab is unaffected."
             )
         else:
-            with timeframe_scope(forecast_tf.key):
+            with timeframe_scope(projection_tf.key):
                 render_forecast_tab(
-                    forecast_pipe, forecast_symbol,
+                    projection_pipe, projection_symbol,
                     amplitude_weight=cfg["amplitude_weight"],
                 )
+                # The actual-price projection, drawn on the Projection tab so the
+                # reader can see the forecast in dollars rather than percentage
+                # offsets.  It is the same path object as the percentage chart above,
+                # so it is always available whenever that one is.  It reads the
+                # *Recent bars* slider so it stays in sync with the reference chart.
+                recent = int(st.session_state.get(projection_recent_key(),
+                                                  _tf().forecast_history_bars))
+                if path := forecast_path_for(
+                    projection_symbol, projection_pipe,
+                    length=recent, horizon=FORECAST_PROJECTION_BARS,
+                    k=FORECAST_PATH_MATCHES,
+                    amplitude_weight=cfg["amplitude_weight"],
+                ):
+                    _render_forecast_path_price(
+                        projection_pipe, path, projection_symbol,
+                        length=recent, horizon=FORECAST_PROJECTION_BARS,
+                        k=FORECAST_PATH_MATCHES,
+                        amplitude_weight=cfg["amplitude_weight"],
+                    )
 
     with tab_forecast:
         # **The Forecast ticker input, at the top of this tab's body** -- drawn even
