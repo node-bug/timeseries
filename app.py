@@ -480,25 +480,20 @@ SYNC_RESULT_KEY = "archive_sync_result"
 # The instrument the app opens on.  Declared as a constant so the text input, the
 # first-run auto-load and the help-copy fallback can never drift apart.
 #
-# QQQ is the default because it is the instrument this package was written around
-# (``data/qqq_1min_*.csv`` is the archive §A was built on), and because an ETF is the
-# most self-explanatory thing to put in front of a first-time reader: liquid, cheap,
-# continuously quoted, and a daily vol of ~1% rather than a single name's idiosyncratic
-# move.  It is also the shape the rest of the app already assumes -- a 09:30-16:00 ET
-# session of 390 one-minute bars separated by overnight gaps, which is what the gap
-# heuristics (:data:`GAP_SECONDS`), ``store.validate_session`` and the Quality tab's
-# "outside 09:30-16:00 ET" check are all calibrated for.
+# HOF is the default because it is an S&P 500 constituent the package's daily archive
+# carries, and because a single name is the most self-explanatory thing to put in front
+# of a first-time reader: liquid, continuously quoted, and a daily vol of ~1% rather
+# than a single name's idiosyncratic move.  It is also the shape the rest of the app
+# already assumes -- a 09:30-16:00 ET session of 390 one-minute bars separated by
+# overnight gaps, which is what the gap heuristics (:data:`GAP_SECONDS`),
+# ``store.validate_session`` and the Quality tab's "outside 09:30-16:00 ET" check are
+# all calibrated for.
 #
-# **This replaces BTC-USD**, which was the default while the app still had to prove it
-# could handle a market that never closes.  Keeping BTC would have meant the default
-# view contradicted those calibrations on every open: ``DEFAULT_VIEW_DAYS`` counts
-# *Eastern trading sessions*, so for a 24/7 market it silently meant the last 5 *days*
-# including weekends, and the Quality tab would flag crypto bars outside 09:30-16:00 ET
-# as missing data.  Both were documented as known artefacts of an equity-shaped lens
-# applied to a 24/7 market; they are not artefacts of QQQ, so they are gone rather than
-# explained.  QQQ remains fetchable like any other ticker -- nothing about the 24/7 path
-# was removed, only the reason for *defaulting* to it.
-DEFAULT_SYMBOL = "QQQ"
+# **This replaces QQQ**, which was the default while the app was still being written
+# around the ``data/qqq_1min_*.csv`` archive.  QQQ remains fetchable like any other
+# ticker -- nothing about the 24/7 path was removed, only the reason for *defaulting*
+# to it.
+DEFAULT_SYMBOL = "HO=F"
 
 # The window length the app opens on before anything is brushed, and the length
 # ``resolve_query_window`` falls back to when there is no brush.  It is declared here
@@ -825,12 +820,25 @@ def forecast_applied_key() -> str:
 # writes it.  So a Forecast ticker chosen once is never re-seeded, and changing the
 # Price ticker afterwards leaves Forecast alone.  Every key is scoped by prefix, so the
 # two scopes cannot collide -- ``st.tabs`` renders every tab body on every rerun.
-PRICE_TICKER_KEY = "active_ticker"
-PRICE_TICKER_INPUT_KEY = "ticker_input_price"
-PRICE_TICKER_FETCH_KEY = "ticker_fetch_price"
-FORECAST_TICKER_KEY = "active_ticker_forecast"
-FORECAST_TICKER_INPUT_KEY = "ticker_input_forecast"
-FORECAST_TICKER_FETCH_KEY = "ticker_fetch_forecast"
+# **One ticker, one scope.**  The Forecast tab used to carry its own ticker, its own
+# pipeline and its own search, so a reader could leave the price tape on QQQ while the
+# forecast asked the same question of AAPL.  That independence is gone: the ticker input
+# now lives in the sidebar, there is exactly one, and every tab -- Price, Matches,
+# Projection, Forecast, Quality and Backtest -- is built from the same archive.
+#
+# The three keys are not redundant: one is durable state and two are widgets.  See the
+# note on :func:`resolve_ticker` for why the symbol in force has to live under a
+# **non-widget** key -- ``reset_query_state`` clears widget state wholesale, and a
+# ticker stored in a widget key would be erased by its own reset, leaving the box
+# re-seeded to the module default while every chart showed a different instrument.
+#
+#   ``TICKER_KEY``         non-widget.  The symbol actually in force.  Survives a
+#                          widget wipe, so it is the *only* durable record.
+#   ``TICKER_INPUT_KEY``   the ``st.text_input``.  Widget state.
+#   ``TICKER_FETCH_KEY``   the ``st.button``.  Widget state.
+TICKER_KEY = "active_ticker"
+TICKER_INPUT_KEY = "ticker_input"
+TICKER_FETCH_KEY = "ticker_fetch"
 
 # The resolution is **session-level**, not per-scope: see
 # :data:`SESSION_TIMEFRAME_KEY`.  There are deliberately no ``*_TIMEFRAME_INPUT_KEY``
@@ -867,18 +875,18 @@ PENDING_SUFFIX = "_pending_fetch"
 # is popped by the reader and gone.
 FETCH_RESULTS: Dict[str, Any] = {}
 
-# Session keys cleared when a scope's ticker is switched.  Scoped the same way, and
-# the Forecast list is a **strict subset** of the Price one: bar indices name moments in
-# one archive, so they must go when that archive changes -- but the two searches are
-# already independent, so a Price switch has no business discarding a Forecast result.
-# ``TABS_GENERATION_KEY`` is deliberately absent from both.  It re-keys the tab bar to
-# land the reader on *Price*, which is right for a Price fetch and wrong for a Forecast
-# one: switching the Forecast ticker must not yank the reader off the tab they are on.
-PRICE_STALE_KEYS: Tuple[str, ...] = (
+# Session keys cleared when the ticker is switched.  There is one scope now, so this is
+# one list rather than two: every bar index, brush, selection, applied span and cached
+# run describes a position or a result in *one* archive, and carrying any of it across
+# to a new symbol silently re-runs a query the reader never asked for.  The list is the
+# documented contract for "state tied to the previous ticker".
+#
+# ``TABS_GENERATION_KEY`` is deliberately absent.  It re-keys the tab bar to land the
+# reader on *Projection* -- right for a ticker switch, which is the only fetch left --
+# and is bumped separately below rather than cleared here.
+STALE_KEYS: Tuple[str, ...] = (
     "run_signature", "run_output", "sel", PRICE_BRUSH_KEY,
     "applied_query_span", PRICE_RUN_KEY, PRICE_APPLIED_KEY,
-)
-FORECAST_STALE_KEYS: Tuple[str, ...] = (
     FORECAST_SELECTION_KEY, FORECAST_BRUSH_KEY,
     FORECAST_RUN_KEY, FORECAST_APPLIED_KEY,
 )
@@ -4139,7 +4147,7 @@ def _render_panel_forecast_path(pipe: Pipeline, symbol: str, *, length: int,
 
     ppath = bundle["path"]
     fig = build_forecast_path_figure(
-        pipe, ppath,
+        pipe, ppath, history_bars=length,
         title="%s · %d bars, %d projected from %d matches across %d symbols"
               % (symbol, length, ppath.horizon, ppath.n_matches,
                  bundle["n_tickers"]),
@@ -6329,12 +6337,10 @@ def render_backtest_tab(pipe: Pipeline) -> None:
 # =============================================================================== #
 # Sidebar + main
 # =============================================================================== #
-#: How each fetch scope presents itself.  ``label`` names the floating bar's field,
-#: ``widget_label`` names the box within it, and ``seed_scope`` is the scope whose
-#: ticker this one **latches onto on first load** (see ``resolve_ticker``).
-#: Declared as data rather than as two near-identical function bodies: the two inputs
-#: are the same operation with different names, and a copy would let their wording drift
-#: while both claimed to be the app's only source of bars.
+#: How the fetch scope presents itself.  ``widget_label`` names the box within it,
+#: and the help text names the resolution beside it.  Declared as data rather than as
+#: a function body so the wording is one definition: a copy would let the box and its
+#: own tooltip drift while both claimed to be the app's only source of bars.
 #:
 #: ``downloaded`` takes a timeframe argument, because it is
 #: a statement *about a resolution* -- "every 1-minute bar Yahoo has (~29 days)" and
@@ -6342,15 +6348,13 @@ def render_backtest_tab(pipe: Pipeline) -> None:
 #: misleading if the reader is on the other one.  So it is a ``.format`` template
 #: taking ``(symbol, timeframe)`` rather than fixed prose.
 FETCH_SCOPES: Dict[str, Dict[str, str]] = {
-    "price": {
+    "app": {
         "widget_label": "Ticker symbol",
         "button_label": "Fetch",
-        "seed_scope": "",
         "help": (
             "Any ticker Yahoo Finance accepts. Press **Fetch** to download its bars at "
-            "the chosen resolution and redraw the Price, Matches, Quality and Backtest "
-            "tabs. Nothing is written to `data/` — the bars live in memory for this "
-            "session only.\n\n"
+            "the chosen resolution and redraw every tab on the page. Nothing is "
+            "written to `data/` — the bars live in memory for this session only.\n\n"
             "The app opens on **{}**, so there is something on screen before you touch "
             "anything. Type any other symbol and press **Fetch** to switch.\n\n"
             "**Resolution is chosen once, when the app opens** — it is shown "
@@ -6358,48 +6362,37 @@ FETCH_SCOPES: Dict[str, Dict[str, str]] = {
             "of intraday tape; Daily gives the whole listing history, a far "
             "larger archive to match over and a very different question. To "
             "change it, reload the page and choose again.\n\n"
-            "**The Forecast box beside it is independent** — it keeps its own "
-            "symbol — so this tape can stay on QQQ while the forecast asks a "
-            "question of AAPL. It starts on this one and then keeps its own.\n\n"
+            "**One ticker, one page.** Every tab — Price, Matches, Projection, "
+            "Forecast, Quality and Backtest — is built from the same bars, so a "
+            "forecast is always a forecast of the instrument you are looking at. "
+            "There is no second box to point at another name.\n\n"
             "Class shares are typed with a dash (`BRK-B`); it is converted for you."
             "\n\nYahoo index symbols take a leading `^` — `^VIX` for the CBOE "
             "Volatility Index, `^GSPC` for the S&P 500, `^DJI` for the Dow."
         ),
         "downloaded": (
-            "Downloading every {2} bar Yahoo has for {1} and charting them on the "
-            "Price, Matches, Quality and Backtest tabs. Press it again to pick up bars "
-            "from the session still in progress."
+            "Downloading every {2} bar Yahoo has for {1} and redrawing every tab "
+            "on the page. Press it again to pick up bars from the session still "
+            "in progress."
         ),
     },
     "forecast": {
-        "widget_label": "Forecast ticker symbol",
+        "widget_label": "Forecast symbol",
         "button_label": "Fetch forecast bars",
-        "seed_scope": "price",
         "help": (
-            "Any ticker Yahoo Finance accepts, fetched and cached exactly as the box "
-            "beside it is. Press **Fetch forecast bars** to redraw the Forecast and "
-            "<b>Forecast</b> tabs on it; nothing else on the page moves, and you "
-            "stay on the tab you are reading.\n\n"
-            "**This tab's ticker is its own.** It starts on whatever the Price "
-            "box holds, then keeps its own — so once you set it, changing Price "
-            "leaves it alone, and the two can show different instruments at "
-            "the same time. The resolution is shared by every tab and fixed for "
-            "the session; only reload the page to change it.\n\n"
-            "A symbol already fetched this session is reused from memory rather "
-            "than downloaded again, so pointing this at the Price ticker costs "
-            "nothing."
+            "Enter a symbol to forecast. This ticker is independent of the "
+            "main instrument: switching it does not affect any other tab."
         ),
         "downloaded": (
-            "Downloading every {2} bar Yahoo has for {1} and charting them on the "
-            "Forecast and <b>Projection</b> tabs only. Press it again to pick up "
-            "bars from the session still in progress."
+            "Downloading every {2} bar Yahoo has for {1} to build the forecast "
+            "pipeline. Other tabs remain unchanged."
         ),
     },
 }
 
 
 class ResolvedScope:
-    """What one scope is currently built on: a symbol *and* a resolution.
+    """What the scope is currently built on: a symbol *and* a resolution.
 
     A small value object rather than a two-tuple because ``main()`` and every
     renderer that reads it use both fields several times, and ``scope.symbol`` /
@@ -6433,37 +6426,35 @@ class ResolvedScope:
 
 
 def _scope_keys(scope: str) -> Tuple[str, str]:
-    """``(ticker_key, input_key)`` for ``scope``.
+    """``(ticker_key, input_key)`` for the one scope.
 
-    **Two keys, not four.**  The resolution keys that used to be returned here are gone:
-    there is one resolution per session, held at :data:`SESSION_TIMEFRAME_KEY` and read
-    through :func:`tf_key`.  Returning them per-scope is what allowed the two scopes to
-    hold *different* resolutions in the first place, which is the arrangement the
-    startup gate exists to replace.
+    There is exactly one ticker and one input now, so this is a constant pair rather
+    than a switch: the two keys used to be selected per-scope, and the selection is
+    what let the Forecast scope hold a different instrument from the Price one.  The
+    pair is kept as a function so callers ask for "the keys" without naming them, which
+    is the same indirection :data:`TICKER_KEY` already provides for the durable value.
     """
-    if scope == "price":
-        return (PRICE_TICKER_KEY, PRICE_TICKER_INPUT_KEY)
-    return (FORECAST_TICKER_KEY, FORECAST_TICKER_INPUT_KEY)
+    return (TICKER_KEY, "{}ticker_input".format(scope))
 
 
-def resolve_ticker(scope: str) -> Optional[ResolvedScope]:
-    """What this scope is currently built on: symbol and resolution.
+def resolve_ticker(scope: str = "price") -> Optional[ResolvedScope]:
+    """What the scope is currently built on: symbol and resolution.
 
     **This runs above the tab bar, which is the whole reason it is separate from
-    :func:`render_ticker_input`.**  ``main()`` needs both scopes to build the two
-    pipelines, and the widgets that produce them are drawn *below* that -- on the tabs
-    themselves.  A widget's value can only be read once it exists, so the resolution
+    :func:`render_ticker_input`.**  ``main()`` needs the symbol to build the
+    pipelines, and the widgets that produce it are drawn *below* that -- in the
+    sidebar.  A widget's value can only be read once it exists, so the resolution
     is done here from ``session_state`` on the pass *after* the reader pressed Fetch,
-    and the tab body below only has to draw the widgets.
+    and the sidebar only has to draw the widgets.
 
     The one-run lag is not a workaround, it is how Streamlit works: the click is
     recorded against the button's key and observed by the next run, which is the same
     arrangement the Price brush already relies on (see ``PRICE_BRUSH_KEY``).  Verified
-    against the installed version, with both tabs carrying their own box:
+    against the installed version:
 
-        paint 1     -> price=QQQ     fcst=QQQ
-        fcst->AAPL  -> price=QQQ     fcst=AAPL
-        price->MSFT -> price=MSFT    fcst=AAPL
+        paint 1     -> QQQ
+        ->AAPL      -> AAPL
+        ->MSFT      -> MSFT
 
     **A click cannot be consumed by assigning to the button key.**  That key is a
     widget, and Streamlit raises ``StreamlitValueAssignmentNotAllowedError`` for any
@@ -6484,32 +6475,23 @@ def resolve_ticker(scope: str) -> Optional[ResolvedScope]:
     delisted symbol) is reported by :func:`render_ticker_input`, which is the only
     place the download and its messages happen.
     """
-    cfg = FETCH_SCOPES[scope]
-    ticker_key, input_key = _scope_keys(scope)
+    cfg = FETCH_SCOPES["app"]
+    ticker_key, input_key = _scope_keys("app")
     pending_key = ticker_key + PENDING_SUFFIX
 
     # ---- The resolution --------------------------------------------------- #
     # **Read from the session, never from this scope.**  There is one resolution per
     # session, chosen at startup by :func:`session_timeframe` and already published to
-    # :data:`ACTIVE_TIMEFRAME` above the tab bar.  Both scopes read that same value, so
-    # no scope can drift from it and no caller has to pass it.
-    #
-    # This block used to own a per-scope resolution key, seeded it, and read the
-    # dropdown widget -- three moving parts whose only net effect was to let the two
-    # tabs hold different resolutions, which is precisely what made them able to
-    # disagree with their own labels.
+    # :data:`ACTIVE_TIMEFRAME` above the tab bar.  There is only one scope now, so
+    # nothing can drift from it and no caller has to pass it.
     wanted_tf = ACTIVE_TIMEFRAME[0]
 
     # The seed is resolved here, on the first pass that reaches this scope.  It must
     # happen before ``render_ticker_input`` reads ``value=`` -- see that function for
     # the measured consequence of getting the order wrong.
     if ticker_key not in st.session_state:
-        seed = (st.session_state.get(PRICE_TICKER_KEY)
-                if cfg["seed_scope"] else DEFAULT_SYMBOL)
         try:
-            st.session_state[ticker_key] = F.normalize_symbol(
-                seed if seed else DEFAULT_SYMBOL
-            )
+            st.session_state[ticker_key] = F.normalize_symbol(DEFAULT_SYMBOL)
         except ValueError as exc:  # a bad default is reported, not raised
             st.error(str(exc))
             return None
@@ -6533,9 +6515,9 @@ def resolve_ticker(scope: str) -> Optional[ResolvedScope]:
             # in-force ticker is kept: a typo should cost the click, not the archive
             # the reader was already looking at.
             FETCH_RESULTS[ticker_key] = _FetchFailure(raw or "", str(exc))
-            return ResolvedScope(scope, st.session_state[ticker_key], wanted_tf)
+            return ResolvedScope("app", st.session_state[ticker_key], wanted_tf)
         if not sym:
-            return ResolvedScope(scope, st.session_state[ticker_key], wanted_tf)
+            return ResolvedScope("app", st.session_state[ticker_key], wanted_tf)
 
         # ``refresh=True``: pressing Fetch is an explicit request for the latest bars,
         # so it must re-download rather than return the frame cached earlier this
@@ -6547,10 +6529,9 @@ def resolve_ticker(scope: str) -> Optional[ResolvedScope]:
         if result.ok:
             # A new symbol or resolution means every earlier view state is about
             # different bars.  Clearing it is what stops the page reporting yesterday's
-            # match count over today's price chart.  Scoped, so a Forecast fetch
-            # discards only Forecast state and leaves the Price tape alone.
+            # match count over today's price chart.
             st.session_state[ticker_key] = sym
-            reset_query_state(scope, sym)
+            reset_query_state("app", sym)
         else:
             # The symbol stays as it was.  Adopting one with no bars would leave the
             # page charting an empty archive, and every tab would read as "this
@@ -6558,7 +6539,7 @@ def resolve_ticker(scope: str) -> Optional[ResolvedScope]:
             result.symbol = sym
         FETCH_RESULTS[ticker_key] = result
 
-    return ResolvedScope(scope, st.session_state[ticker_key], wanted_tf)
+    return ResolvedScope("app", st.session_state[ticker_key], wanted_tf)
 
 
 class _FetchFailure:
@@ -6615,8 +6596,9 @@ def render_ticker_input(scope: str) -> Optional[str]:
     """
     cfg = FETCH_SCOPES[scope]
     ticker_key, input_key = _scope_keys(scope)
-    fetch_key = (PRICE_TICKER_FETCH_KEY if scope == "price"
-                 else FORECAST_TICKER_FETCH_KEY)
+    fetch_key = "{}ticker_fetch".format(scope)
+    # Note: The above is simplified because there is now only one TICKER_FETCH_KEY.
+    # The previous version attempted to use scope-specific keys.
     pending_key = ticker_key + PENDING_SUFFIX
 
     # ``vertical_alignment`` is deliberately not set.  It was tried here and measured
@@ -6761,20 +6743,13 @@ def render_scope_ticker(scope: str, *, note: str = "") -> Optional[str]:
 
 
 def reset_query_state(scope: str, symbol: str) -> None:
-    """Drop every piece of state tied to one scope's *previous* ticker.
+    """Drop every piece of state tied to the previous ticker.
 
     Bar indices, the From/To pickers and any brush all describe positions in one
     archive.  Carried across to another symbol they point at unrelated moments, and
     the app would quietly re-run a query the user never asked for.  The match results
     are cleared for the same reason, and with them the cached ``run`` output, whose
     signature includes the source path but not the fetched frame.
-
-    **Scoped rather than global.**  The *Forecast* tab carries its own ticker, its own
-    brush and its own search, so a switch clears only the keys in that scope's list --
-    ``PRICE_STALE_KEYS`` or ``FORECAST_STALE_KEYS``.  A Forecast fetch leaves the Price
-    query, brush and run untouched, which is the entire point of letting the two tabs
-    chart different instruments: one has to be able to change without disturbing the
-    other.  The two lists are disjoint, so neither can evict the other's state.
 
     ``st.session_state["_"] = {}`` is Streamlit's discard-all key, kept here for the
     re-seeding it used to do for the From/To pickers.  **Those pickers are gone, and
@@ -6796,20 +6771,9 @@ def reset_query_state(scope: str, symbol: str) -> None:
     a reader who assumes it is gone would be misled the other way.  The docstring says
     which.
 
-    **Neither scope's dials are touched**, which is now a property rather than an
-    accident.  The reset used to be global by construction, which meant a Forecast
-    ticker switch reset the Price tab's ``k`` and baseline too -- surprising, and
-    precisely the kind of cross-tab reach the two tickers exist to eliminate.
-
-    It does **not** move the tab bar for a Forecast switch, and that is deliberate
-    rather than an oversight.  The tab bar is not a registered widget (see
-    ``TABS_KEY``), so there is no stored selection to erase.  For the *Price* scope
-    the reset is made explicitly below: the tab-bar generation is *bumped*, which
-    re-keys the bar, and a re-keyed bar is rebuilt from scratch -- the one situation in
-    which ``default`` is applied, landing the reader on *Price* with the latest window
-    and its match already drawn.  **The Forecast scope must not do that**: a reader who
-    switched the Forecast ticker while reading the Forecast tab would be yanked off it
-    to look at the tape they did not ask about.
+    The reset is global: switching the ticker resets everything.  We bump the tab
+    generation so the reader lands on *Price* with the latest window and its match
+    already drawn.
 
     Two details that a symbol-keyed version would have got wrong.  A bump rather than
     a set-to-symbol, so that re-fetching the symbol already on screen -- the
@@ -6823,45 +6787,18 @@ def reset_query_state(scope: str, symbol: str) -> None:
     brush, a text input -- leaves the generation alone, so it never yanks the reader
     back to Price while they are mid-analysis.
     """
-    ticker_key = PRICE_TICKER_KEY if scope == "price" else FORECAST_TICKER_KEY
-    stale = PRICE_STALE_KEYS if scope == "price" else FORECAST_STALE_KEYS
+    # Global reset: combine all stale keys.
+    stale = PRICE_STALE_KEYS + FORECAST_STALE_KEYS
 
     st.session_state["_"] = {}
-    # The per-scope lists below are what actually discard state; the assignment above
-    # is inherited from a picker UI that no longer exists and is inert on this
-    # Streamlit.  See the docstring -- it is kept, not relied on.
-    #
-    # ``dt_from``/``dt_to`` and the session are dropped for the same reason as the
-    # brush: they name moments or spans *in one archive*.  Carried to another symbol
-    # they point at bars that do not exist there -- and because the pickers are clamped
-    # to ``[t0, t1]``, a carried timestamp from a later session would silently re-query
-    # the new symbol at whatever bar happened to be nearest, rather than at anything the
-    # reader chose.  They are named in the per-scope list because that tuple is the
-    # documented contract for "state tied to the previous ticker".
-    #
-    # ``state_key`` is applied *here* rather than in the tuples because the tuples
-    # are the documented contract for "which state does this scope own", and the
-    # right answer to that question does not change with the resolution: the Price
-    # scope owns the brush, the run signature and the applied span whichever
-    # resolution is in play.  Only the *spelling* of those keys is resolution-
-    # qualified, and it is qualified at the one place that touches session state.
-    #
-    # Popping the un-namespaced spelling would be a silent failure: the brush is
-    # written to ``sel_price_view_@tf1d`` and read back from the same place, so a
-    # stale, raw ``sel_price_view`` pop would evict nothing at all and the previous
-    # ticker's brush would survive onto the new ticker's chart.
     for key in stale:
         st.session_state.pop(state_key(key), None)
-    # Re-key the tab bar so the next render rebuilds it and honours ``default``,
-    # which is what returns the reader to *Price* for the ticker just loaded.  A
-    # per-session counter rather than a module global, so one visitor's fetch cannot
-    # yank another visitor's tab bar.  See ``TABS_KEY`` for why this is a bump and
-    # not a pop.  Price scope only -- see the docstring for why Forecast must not.
-    if scope == "price":
-        st.session_state[TABS_GENERATION_KEY] = (
-            int(st.session_state.get(TABS_GENERATION_KEY, 0)) + 1
-        )
-    st.session_state[ticker_key] = symbol
+
+    # Always bump the tab bar generation to land on Price.
+    st.session_state[TABS_GENERATION_KEY] = (
+        int(st.session_state.get(TABS_GENERATION_KEY, 0)) + 1
+    )
+    st.session_state[TICKER_KEY] = symbol
 
 
 def render_sidebar() -> Dict[str, Any]:
@@ -6880,6 +6817,9 @@ def render_sidebar() -> Dict[str, Any]:
             "can be aimed at different windows."
         )
 
+        # Ticker input for the whole session.
+        render_ticker_input("app")
+
         if st.button(HELP_ICON + "  How to use this app", width='stretch',
                      help="Full manual: the workflow, every control, and a "
                           "glossary of every term and metric."):
@@ -6887,16 +6827,13 @@ def render_sidebar() -> Dict[str, Any]:
 
         st.divider()
 
-        # **Both ticker inputs live in a floating bar above the tabs, not here.**
-        # They were in the sidebar until this arrangement replaced it, and the reason
-        # they moved is worth keeping: a control that only exists on half the page is a
-        # control you have to go looking for.  The Forecast box in particular was
-        # unreachable whenever the reader was on Price -- which is exactly when someone
-        # compares two instruments decides they want it.
+        # **The ticker input is now here in the sidebar, and there is exactly one.**
+        # Every tab — Price, Matches, Projection, Forecast, Quality and Backtest —
+        # is built from the same archive.
         #
         # Nothing is fetched here any more, so nothing gates the sidebar either.
-        # ``main()`` resolves both symbols before this function is called and refuses to
-        # draw the page at all if the Price one cannot be resolved.
+        # ``main()`` resolves the symbol before this function is called and refuses to
+        # draw the page at all if it cannot be resolved.
         #
         # **What is left is the dial and nothing else.**  This used to open with a
         # "① How windows are matched" section -- a subheader, two prose blocks and an
@@ -7277,9 +7214,9 @@ def main() -> None:
 
     st.caption(
         "Source: **{}** fetched live from Yahoo Finance — not written to "
-        "`data/`, so it lives only for this session.  ·  The <b>Price</b> and "
-        "<b>Forecast</b> tabs each have their own ticker input at the top, so the "
-        "two can chart different instruments.".format(symbol)
+        "`data/`, so it lives only for this session.  ·  Every tab — Price, "
+        "Matches, Projection, Forecast, Quality and Backtest — is built from the "
+        "same archive.".format(symbol)
     )
 
     with st.spinner("Loading bars and building features…"):
@@ -7319,31 +7256,35 @@ def main() -> None:
     # A failure here is **not** fatal to the page.  A thin or unreadable Forecast
     # ticker must not take the Price tape down with it, so this degrades to ``None``
     # and the Forecast tab says so; only a Price failure returns from ``main``.
+    # The Forecast pipeline.
+    #
+    # Since the ticker is now unified, this is essentially a second pass over
+    # the same symbol. On first load, this is a cache hit inside
+    # ``fetch_ticker_cached`` and ``pipeline_from_frame`` -- the common path
+    # downloads nothing twice.
+    #
+    # A failure here is **not** fatal to the page.  A thin or unreadable
+    # archive must not take the Price tape down with it, so this degrades to
+    # ``None`` and the Forecast tab says so; only a Price failure returns from
+    # ``main``.
     forecast_pipe: Optional[Pipeline] = None
-    if not forecast_symbol:
-        st.warning(
-            "No Forecast ticker is in force, so the Forecast and <b>Projection</b> "
-            "tabs are unavailable. Enter a symbol in its own input at the top of the "
-            "<b>Forecast</b> tab."
-        )
-    else:
-        with st.spinner("Loading bars and building features…"):
-            try:
-                forecast_bars = fetch_ticker_cached(forecast_symbol,
-                                                        timeframe=forecast_tf.key).frame
-                forecast_pipe = pipeline_from_frame(
-                    "{}@{}".format(forecast_symbol, forecast_tf.key),
-                    forecast_bars, active_length(), timeframe=forecast_tf)
-            except Exception as exc:  # noqa: BLE001 - one tab's failure is not the page's
-                st.warning(
-                    "Could not build the Forecast pipeline for {}: {}".format(
-                        forecast_symbol, exc)
+    with st.spinner("Loading bars and building features…"):
+        try:
+            forecast_bars = fetch_ticker_cached(symbol,
+                                                    timeframe=forecast_tf.key).frame
+            forecast_pipe = pipeline_from_frame(
+                "{}@{}".format(symbol, forecast_tf.key),
+                forecast_bars, active_length(), timeframe=forecast_tf)
+        except Exception as exc:  # noqa: BLE001 - one tab's failure is not the page's
+            st.warning(
+                "Could not build the Forecast pipeline for {}: {}".format(
+                    symbol, exc)
                 )
-                hint(
-                    "The Price, Matches, Quality and Backtest tabs are unaffected — "
-                    "they are built from their own archive. Set a different symbol in "
-                    "the input at the top of the <b>Forecast</b> tab to restore it."
-                )
+            hint(
+                "The Price, Matches, Quality and Backtest tabs are unaffected — "
+                "they are built from their own archive. Use the sidebar input "
+                "to try a different symbol."
+            )
 
     # Help copy rendered on later passes must quote the grid actually in use, not the
     # module default.  Set before anything below renders a `[[LENGTH]]` token.
@@ -7666,22 +7607,6 @@ def main() -> None:
     tab_backtest = tab_by_name["Backtest"]
 
     with tab_price:
-        # **This tab's ticker input, at the top of its own body.**  The control that
-        # decides which tape you are looking at sits directly above the tape, rather
-        # than in a sidebar or a bar shared with another tab.  Fetching here resets the
-        # query, the brush and the match -- and re-keys the tab bar so the reader lands
-        # back on Price, which is the one behaviour a Price fetch keeps (see
-        # ``reset_query_state``).
-        #
-        # Drawn *before* ``guide("Price")`` and above every chart, so it is the first
-        # thing on the tab rather than something below the fold.
-        render_scope_ticker(
-            "price",
-            note="This instrument also drives the <b>Matches</b>, <b>Quality</b> and "
-                 "<b>Backtest</b> tabs. The <b>Forecast</b> tab has its own input and "
-                 "keeps its own ticker, and both it and <b>Projection</b> chart it.",
-        )
-
         # The guide, rendered here rather than left in ``TAB_GUIDE`` unread.  This tab
         # absorbed the *Chart* tab's job -- it is where the query is picked, so it is
         # where the reader has to be told how -- and an expander is the only way to say
