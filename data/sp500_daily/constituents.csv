@@ -405,6 +405,7 @@ SBUX,Starbucks,Consumer Discretionary,Restaurants,SBUX
 SCHW,Charles Schwab Corporation,Financials,Investment Banking & Brokerage,SCHW
 SHW,Sherwin-Williams,Materials,Specialty Chemicals,SHW
 SJM,J.M. Smucker Company (The),Consumer Staples,Packaged Foods & Meats,SJM
+SKYD,Paramount Skydance Corporation,Communication Services,Movies & Entertainment,SKYD
 SLB,Schlumberger,Energy,Oil & Gas Equipment & Services,SLB
 SMCI,Supermicro,Information Technology,"Technology Hardware, Storage & Peripherals",SMCI
 SNA,Snap-on,Industrials,Industrial Machinery & Supplies & Components,SNA
@@ -449,6 +450,7 @@ TSLA,"Tesla, Inc.",Consumer Discretionary,Automobile Manufacturers,TSLA
 TSN,Tyson Foods,Consumer Staples,Packaged Foods & Meats,TSN
 TT,Trane Technologies,Industrials,Building Products,TT
 TTWO,Take-Two Interactive,Communication Services,Interactive Home Entertainment,TTWO
+TWLO,Twilio,Information Technology,Systems Software,TWLO
 TXN,Texas Instruments,Information Technology,Semiconductors,TXN
 TXT,Textron,Industrials,Aerospace & Defense,TXT
 TYL,Tyler Technologies,Information Technology,Application Software,TYL
@@ -476,6 +478,7 @@ VRTX,Vertex Pharmaceuticals,Health Care,Biotechnology,VRTX
 VST,Vistra Corp.,Utilities,Electric Utilities,VST
 VTR,Ventas,Real Estate,Health Care REITs,VTR
 VTRS,Viatris,Health Care,Pharmaceuticals,VTRS
+VYLR,Vylor,Consumer Staples,Agricultural Products & Services,VYLR
 VZ,Verizon,Communication Services,Integrated Telecommunication Services,VZ
 WAB,Wabtec,Industrials,Construction Machinery & Heavy Transportation Equipment,WAB
 WAT,Waters Corporation,Health Care,Life Sciences Tools & Services,WAT

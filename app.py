@@ -969,7 +969,7 @@ DEFAULT_VIEW_DAYS = 5
 # fall out of tuple order.  Streamlit falls back to the first tab when ``default`` is
 # ``None``, which means a reordering of ``TAB_ORDER`` would silently change the
 # landing view and break that promise with nothing in the diff to explain it.
-DEFAULT_TAB = "Price"
+DEFAULT_TAB = "Projection"
 
 # ``st.tabs`` only *registers a widget* -- and only reads its selection from
 # ``session_state`` -- when ``on_change`` is passed (Streamlit sets
@@ -7634,11 +7634,11 @@ def main() -> None:
     # first-time reader is pointed now.
 
     # ---------------- Tabs --------------------------------------------------- #
-    # ``default=DEFAULT_TAB`` opens the page on Price -- the bare tape.  Stated
-    # explicitly rather than left to ``TAB_ORDER[0]``; see ``DEFAULT_TAB``.
+    # ``default=DEFAULT_TAB`` opens the page on Projection -- the fixed reference.
+    # Stated explicitly rather than left to ``TAB_ORDER[0]``; see ``DEFAULT_TAB``.
     #
     # ``key=tabs_key()`` is what lets a ticker switch send the reader back to
-    # *Price*: ``reset_query_state`` bumps the generation, a new key is a new block
+    # *Projection*: ``reset_query_state`` bumps the generation, a new key is a new block
     # id, and a new block id is the one situation in which ``default`` is honoured.
     # See ``TABS_KEY``.
     tabs = st.tabs(list(TAB_ORDER), default=DEFAULT_TAB, key=tabs_key())

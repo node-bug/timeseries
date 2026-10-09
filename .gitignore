@@ -115,3 +115,4 @@ System Volume Information
 .gitignore
 .gitattributes
 .gitmodules
+data/sp500_daily/manifest.csv

@@ -150,7 +150,7 @@ _WHY_EMPTY = {
 # anchor -- so ``^^VIX`` and ``A^B`` are still refused.  Widening the set does not
 # weaken the traversal defence: ``^`` is not a path separator, and ``.`` has already
 # been collapsed to ``-`` one line below, before this pattern ever runs.
-_SYMBOL_RE = re.compile(r"^\^?[A-Z0-9][A-Z0-9.\-]{0,15}$")
+_SYMBOL_RE = re.compile(r"^\^?[A-Z0-9=][A-Z0-9.\-=]{0,15}$")
 
 # ``data/`` filenames are ``<SYMBOL>_1min_<YYYYMMDD>_<YYYYMMDD>.csv`` or
 # ``<SYMBOL>_1d_<YYYYMMDD>_<YYYYMMDD>.csv``.  Parsing the symbol *and the resolution*
@@ -169,7 +169,7 @@ _SYMBOL_RE = re.compile(r"^\^?[A-Z0-9][A-Z0-9.\-]{0,15}$")
 # so a fetch smoke test would never surface that asymmetry -- only the round-trip
 # test does.
 _ARCHIVE_RE = re.compile(
-    r"^(?P<sym>\^?[A-Za-z0-9][A-Za-z0-9.\-]*)_(?P<slug>"
+    r"^(?P<sym>\^?[A-Za-z0-9=][A-Za-z0-9.\-=]*)_(?P<slug>"
     + "|".join(re.escape(t.filename_slug) for t in TIMEFRAMES.values())
     + r")_(?P<start>\d{8})_(?P<end>\d{8})\.csv$"
 )
