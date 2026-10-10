@@ -7,7 +7,7 @@ On first load the app asks for a **data resolution** â€” `1-minute` or `Daily` â
 builds nothing until you pick. That choice holds for the session; see
 [The resolution is chosen once](#the-resolution-is-chosen-once-when-the-app-opens).
 
-Then type a ticker into the **Price** tab's box at the top of that tab and press
+Then The **Price** tab's box at the top of that tab and press
 **Fetch**, and the tabs redraw on that instrument. The **Forecast** tab has a second
 box of its own, so you can leave the price tape on QQQ while the forecast runs on
 AAPL.

@@ -337,29 +337,29 @@ class TestBandsLineUpHorizontally:
         spans = [(q_start, q_start + length), (m_start, m_start + length)]
         return n - max(e for _, e in spans) + min(s for s, _ in spans) + length
 
-    def test_live_query_and_its_top_match_line_up(self):
-        """The actual view the user sees: live query against its #1 match."""
+    def test_last_window_query_and_its_top_match_line_up(self):
+        """The actual view the user sees: last window query against its #1 match."""
         from timeseries.matching import Query
 
         pipe = Pipeline.from_frame(
             session_bars(FIXTURE_BARS, seed=FIXTURE_SEED), length=self.L)
         q = Query.from_span(pipe.matrix, self.N - self.L, self.N)
         res = pipe.match(q, k=5)
-        assert res.matches, "expected matches for the live query"
+        assert res.matches, "expected matches for the last window query"
 
         for m in res.matches:
             if self._cap(q.start, m.start, self.N, self.L) < self.W:
                 continue  # infeasible at 600 bars; covered separately below
             q_off, m_off, a = self._offsets(q.start, m.start)
             assert abs(q_off - m_off) == 0, (
-                f"live query vs match@{m.start}: bands {abs(q_off - m_off)} bars "
+                f"last window query vs match@{m.start}: bands {abs(q_off - m_off)} bars "
                 f"apart (query {q_off}, match {m_off}, anchor {a})"
             )
 
-    def test_live_query_against_a_late_match_was_402px_apart_before(self):
+    def test_last_window_query_against_a_late_match_was_402px_apart_before(self):
         """The pre-fix offsets, on a pair where alignment is actually achievable.
 
-        The live query is the archive's last window, so it sits flush right at offset
+        The last window query is the archive's last window, so it sits flush right at offset
         ``width - span`` = 540.  A match late enough in the archive can also sit there.
         """
         q_off, m_off, _ = self._offsets(self.N - self.L, 7464)

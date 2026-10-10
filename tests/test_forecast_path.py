@@ -1506,7 +1506,7 @@ def test_an_out_of_range_window_yields_nothing(pipe, window):
 def test_omitting_the_window_keeps_the_reference_behaviour(pipe):
     """``window=None`` still means the archive's most recent bars.
 
-    The always-live chart above the brush relies on this, and it is the reason the
+    The reference chart above the brush relies on this, and it is the reason the
     parameter is an override rather than a replacement: the two callers share one
     implementation without either having to know about the other.
     """

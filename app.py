@@ -949,7 +949,7 @@ CHANNEL_LABELS = FEATURE_COLUMNS
 # of those keys at once and discard every reader's brush, settings and last run on
 # deploy, for no behaviour change.  A future reader who finds ``FORECAST_BRUSH_KEY``
 # "mislabelled" against the *Forecast* tab should leave it alone.
-TAB_ORDER = ("Price", "Matches", "Projection", "Forecast", "Panel", "Quality",
+TAB_ORDER = ("Price", "Matches", "Projection", "Forecast", "Live", "Panel", "Quality",
              "Backtest")
 
 # How much tape the Price tab shows, in trading sessions.
@@ -2313,14 +2313,14 @@ def build_price_figure(pipe: Pipeline, view_start: int, view_stop: int,
     else:
         # Multiplied by 100 so the axis reads in real percentage points (-0.23%). A raw
         # 0.0n fraction beside a "(%)" label is a unit lie the eye cannot parse.
-        y_close = (np.asarray(price, dtype=float) / base - 1.0) * 100.0
-        y_upper = (upper / base - 1.0) * 100.0
-        y_lower = (lower / base - 1.0) * 100.0
-        y_mid = (mid / base - 1.0) * 100.0
+        y_close = np.asarray(price, dtype=float)
+        y_upper = upper
+        y_lower = lower
+        y_mid = mid
         # Kept short: a long axis title is clipped at these panel heights, and the
         # panel title already spells out what the rebasing is.
-        y_label = "change from window start (%)"
-        close_hover = "%{x}<br>%{y:+.2f}%<extra></extra>"
+        y_label = "price"
+        close_hover = "%{x}<br>close %{y:.2f}<extra></extra>"
 
     if draw_candles:
         fig.add_trace(go.Scatter(
@@ -2346,7 +2346,7 @@ def build_price_figure(pipe: Pipeline, view_start: int, view_stop: int,
     if base is not None:
         # Anchored bottom-left with a background: at the top right it lands on the price
         # trace itself, and an unreadable label is worse than no label.
-        fig.add_hline(y=0.0, line=dict(color="rgba(128,128,128,0.5)", width=1, dash="dot"),
+        fig.add_hline(y=base, line=dict(color="rgba(128,128,128,0.5)", width=1, dash="dot"),
                       annotation_text="window start", annotation_position="bottom left",
                       annotation_font=dict(size=10, color="rgba(128,128,128,0.9)"),
                       annotation_bgcolor="rgba(255,255,255,0.75)")
@@ -3046,6 +3046,10 @@ def forecast_path_for(
         return None
 
     if window is None:
+        # The most recent window is the query.
+        # We use the most recent length bars, but the matching happens against
+        # historical windows. The query itself is at the end of the archive,
+        # which is exactly what we want for a "live" forecast.
         start, stop = n - length, n
     else:
         start, stop = int(window[0]), int(window[1])
@@ -3061,19 +3065,24 @@ def forecast_path_for(
     try:
         result = pipe.match(query, k=int(k),
                             amplitude_weight=float(amplitude_weight))
-    except Exception:  # noqa: BLE001 - a failed match must not take the tab down
+    except Exception as e:
+        print(f"DEBUG: pipe.match failed with {e}")
         return None
 
     if not result.matches:
+        print(f"DEBUG: pipe.match found 0 matches for {symbol} (len={length})")
         return None
 
-    return forecast_paths(
+    path = forecast_paths(
         pipe.close,
         np.asarray([m.start for m in result.matches], dtype=np.int64),
         length,
         int(horizon),
         distances=np.asarray([m.distance for m in result.matches], dtype=float),
     )
+    if path is None:
+        print(f"DEBUG: forecast_paths returned None for {symbol} (len={length}, hor={horizon})")
+    return path
 
 
 @st.cache_resource(show_spinner=False, max_entries=4)
@@ -3261,6 +3270,7 @@ def build_forecast_path_figure(
     height: int = 420,
     title: Optional[str] = None,
     window: Optional[Tuple[int, int]] = None,
+    show_median: bool = True,
 ) -> go.Figure:
     """A window of real tape, then the projected path.
 
@@ -3269,6 +3279,11 @@ def build_forecast_path_figure(
     1. the **history**, as a plain close line on the app's usual blue;
     2. the **interquartile band**, as two boundary traces joined by ``fill``;
     3. the **median**, as the line a reader actually follows.
+
+    ``show_median`` toggles the median and its closest-match evidence line.
+    It defaults to ``True`` for the shared reference/forecast charts and is set
+    to ``False`` on the *Live* tab, which shows only the single closest match
+    rather than any aggregate.
 
     The history is rebased to the same ``0%`` anchor as the projection -- the close
     of the **last bar of the window** -- so the two halves are in one unit and meet at
@@ -3336,7 +3351,7 @@ def build_forecast_path_figure(
         base = 1.0
 
     hist_x = np.arange(hist_start, hist_start + hist, dtype=np.int64)
-    hist_y = (close[hist_start:hist_start + hist] / base - 1.0) * 100.0
+    hist_y = close[hist_start:hist_start + hist]
 
     # The projection is anchored on that same bar, so offset 0 -- which
     # ``forecast_paths`` guarantees is exactly 0.0 -- lands on the same x as the
@@ -3345,68 +3360,91 @@ def build_forecast_path_figure(
 
     fig = go.Figure()
 
+    # To avoid the "straight line" effect, we use the percentage return
+    # relative to the anchor for both history and projection.
+    # History: price
+    # Projection: base * (1 + return / 100)
+    hist_y_rel = hist_y
+
     fig.add_trace(go.Scatter(
-        x=hist_x, y=hist_y, mode="lines",
+        x=hist_x, y=hist_y_rel, mode="lines",
         line=dict(color="#1f77b4", width=1.3),
         name="history (last %d bars)" % hist,
-        hovertemplate="%{x}<br>%{y:+.2f}%<extra>history</extra>",
+        hovertemplate="%{x}<br>price %{y:.2f}<extra>history</extra>",
     ))
 
     # Band as a ``tonexty`` pair: the upper boundary is drawn first and the lower
     # one fills to it.  There is no gap being spanned here, so unlike the rolling-band
     # case in ``build_price_figure`` one polygon over the whole projection is enough.
     fig.add_trace(go.Scatter(
-        x=proj_x, y=path.q75, mode="lines",
+        x=proj_x, y=base * (1 + path.q75 / 100.0), mode="lines",
         line=dict(width=0), showlegend=False, hoverinfo="skip",
         name="upper quartile",
     ))
     fig.add_trace(go.Scatter(
-        x=proj_x, y=path.q25, mode="lines",
+        x=proj_x, y=base * (1 + path.q25 / 100.0), mode="lines",
         line=dict(width=0), fill="tonexty",
         fillcolor="rgba(44,160,44,0.18)",
         showlegend=False, hoverinfo="skip",
         name="interquartile range",
     ))
-    fig.add_trace(go.Scatter(
-        x=proj_x, y=path.median, mode="lines",
-        line=dict(color="#2ca02c", width=2),
-        name="median of %d matches" % path.n_matches,
-        hovertemplate="%{x}<br>%{y:+.2f}%<extra>projected</extra>",
-    ))
-
-    # **The single closest match, as its own line.**  The median above is an
-    # aggregate: it says what usually happened, and on its own it hides the fact that
-    # "usually" may be a compromise between windows that went opposite ways.  The
-    # best match is the one concrete instance behind the aggregate, and drawing it
-    # costs one trace and makes the median auditable -- a reader who wants to know
-    # whether the band is narrow because the evidence agreed or because the
-    # aggregation smoothed it can now see a single window it can check against the
-    # chart above.
-    #
-    # **Rebuilt from ``close`` rather than carried on the path**, because
-    # ``ForecastPath`` stores only the median and the quartiles: it keeps ``starts``
-    # and ``distances`` for attribution, not the individual return series.  Reconstructing
-    # it here is exact -- the same slice and the same rebasing ``forecast_paths``
-    # applies -- so the line is the real forward path of that window, not an
-    # approximation of it.
-    #
-    # **The distance is drawn, not implied.**  A single window is an anecdote, and the
-    # whole point of the §E framing is that the best-looking of thousands is extreme
-    # by construction.  Labelling it "closest match" without its distance would invite
-    # reading it as the expected outcome, which is precisely the misreading the median
-    # exists to prevent; the number is in the trace name so the reader can weigh it.
-    #
-    # **Drawn last and dashed**, so it sits above the band without competing with the
-    # median for attention: the median is the claim, this is the evidence for it.
-    best = _closest_match_path(pipe.close, path)
-    if best is not None:
+    if show_median:
         fig.add_trace(go.Scatter(
-            x=proj_x, y=best, mode="lines",
-            line=dict(color="#ff7f0e", width=1.5, dash="dot"),
-            name="closest match (distance %s)" % (
-                _closest_distance_label(path)),
-            hovertemplate="%{x}<br>%{y:+.2f}%<extra>closest match</extra>",
+            x=proj_x, y=base * (1 + path.median / 100.0), mode="lines",
+            line=dict(color="#2ca02c", width=2),
+            name="median of %d matches" % path.n_matches,
+            hovertemplate="%{x}<br>price %{y:.2f}<extra>projected</extra>",
         ))
+
+        # **The single closest match, as its own line.**  The median above is an
+        # aggregate: it says what usually happened, and on its own it hides the fact that
+        # "usually" may be a compromise between windows that went opposite ways.  The
+        # best match is the one concrete instance behind the aggregate, and drawing it
+        # costs one trace and makes the median auditable -- a reader who wants to know
+        # whether the band is narrow because the evidence agreed or because the
+        # aggregation smoothed it can now see a single window it can check against the
+        # chart above.
+        #
+        # **Rebuilt from ``close`` rather than carried on the path**, because
+        # ``ForecastPath`` stores only the median and the quartiles: it keeps ``starts``
+        # and ``distances`` for attribution, not the individual return series.  Reconstructing
+        # it here is exact -- the same slice and the same rebasing ``forecast_paths``
+        # applies -- so the line is the real forward path of that window, not an
+        # approximation of it.
+        #
+        # **The distance is drawn, not implied.**  A single window is an anecdote, and the
+        # whole point of the §E framing is that the best-looking of thousands is extreme
+        # by construction.  Labelling it "closest match" without its distance would invite
+        # reading it as the expected outcome, which is precisely the misreading the median
+        # exists to prevent; the number is in the trace name so the reader can weigh it.
+        #
+        # **Drawn last and dashed**, so it sits above the band without competing with the
+        # median for attention: the median is the claim, this is the evidence for it.
+        best = _closest_match_path(pipe.close, path)
+        if best is not None:
+            # The closest match is also rebased from percentage to absolute price.
+            best_abs = base * (1 + best / 100.0)
+            fig.add_trace(go.Scatter(
+                x=proj_x, y=best_abs, mode="lines",
+                line=dict(color="#ff7f0e", width=1.5, dash="dot"),
+                name="closest match (distance %s)" % (
+                    _closest_distance_label(path)),
+                hovertemplate="%{x}<br>price %{y:.2f}<extra>closest match</extra>",
+            ))
+    else:
+        # The Live tab shows only the single closest match: with k=1 there is no
+        # aggregate, so the projection is the match itself.  It is drawn unconditionally
+        # (not gated on show_median) so the projection is never missing.
+        best = _closest_match_path(pipe.close, path)
+        if best is not None:
+            best_abs = base * (1 + best / 100.0)
+            fig.add_trace(go.Scatter(
+                x=proj_x, y=best_abs, mode="lines",
+                line=dict(color="#ff7f0e", width=1.5, dash="dot"),
+                name="closest match (distance %s)" % (
+                    _closest_distance_label(path)),
+                hovertemplate="%{x}<br>price %{y:.2f}<extra>closest match</extra>",
+            ))
 
     # The boundary, drawn before the shading so the shading does not wash it out.
     fig.add_vline(x=anchor, line=dict(color="rgba(128,128,128,0.9)", width=1.4,
@@ -3444,7 +3482,7 @@ def build_forecast_path_figure(
         stamp_label(pipe.bars["timestamp"].iloc[i], key=pipe.timeframe) for i in ticks
     ] + ["+%d %s" % (o, bar_unit(o)) for o in proj_ticks]
 
-    fig.add_hline(y=0.0, line=dict(color="rgba(128,128,128,0.45)", width=1, dash="dot"))
+    # No zero-line for absolute price.
     fig.update_layout(
         height=height,
         margin=dict(l=64, r=8, t=46, b=54),
@@ -3458,7 +3496,7 @@ def build_forecast_path_figure(
             range=[hist_start - 0.5, stop - 0.5],
         ),
         yaxis=dict(
-            title="change from the window's last close (%)",
+            title="price",
             showgrid=True, gridcolor="rgba(128,128,128,0.15)", automargin=True,
         ),
         title=dict(text=title, font=dict(size=12)) if title else None,
@@ -3617,7 +3655,17 @@ def _render_best_match_pair(pipe: Pipeline, query: M.Query, m: M.Match, rank: in
     # through the same axis, which is the whole point of framing on the match.
     m_y_range = y_range
     if pannable:
-        m_y_range = rebased_view_range(pipe, m_view, m.start, pad)
+        # Use the raw price range for the pannable panel since we are no longer rebasing.
+        # We need a range that covers the visible window in nominal prices.
+        lo, hi = m_view
+        window = pipe.close[lo:hi]
+        if window.size > 0:
+            w_min, w_max = float(window.min()), float(window.max())
+            span = w_max - w_min
+            margin = 0.08 * span if span > 0 else 0.05
+            m_y_range = (w_min - margin, w_max + margin)
+        else:
+            m_y_range = None
 
     if show_captions:
         st.caption(
@@ -3634,7 +3682,7 @@ def _render_best_match_pair(pipe: Pipeline, query: M.Query, m: M.Match, rank: in
                 pipe, *q_view,
                 query_start=q_start, query_stop=q_stop,
                 span_label="query", title="query · rebased to its first bar",
-                rebase_at=q_start, y_range=y_range,
+                rebase_at=None, y_range=y_range,
                 selectable=False, height=height,
             ),
             width='stretch', key="qchart_%s_%d" % (scope, rank),
@@ -3654,7 +3702,7 @@ def _render_best_match_pair(pipe: Pipeline, query: M.Query, m: M.Match, rank: in
         # framed by its own bars rather than stretched to line up with the query.
         # ``selectable=False`` because nothing ever reads a selection from here --
         # only the two charts that define the query are brushable.
-        rebase_at=m.start, y_range=m_y_range,
+        rebase_at=None, y_range=m_y_range,
         selectable=False, height=height,
         # The three pan arguments are all ``None``/``False`` unless ``pannable`` was
         # requested, so the Matches tab's panels -- and the Price tab's query chart --
@@ -3749,6 +3797,67 @@ def _render_search_controls(scope: str) -> Dict[str, Any]:
         "seed": 0,
         "run_clicked": run_clicked,
     }
+
+
+def render_live_tab(pipe: Pipeline, symbol: str) -> None:
+    """The **Live** tab: "Where this usually goes next" for 1-minute data.
+
+    This tab identifies historical patterns matching recent price action
+    and projects the most likely subsequent movement. It is only available
+    for 1-minute resolution data.
+    """
+    # Requirement 1: Resolution Check & Guardrails
+    if _tf().key != "1m":
+        st.info("Live projection is only available for 1-minute resolution data.")
+        return
+
+    # Requirement 2: User Configuration (UI Controls)
+    st.subheader("Live Projection Settings")
+    # Requirement 2.1: Recent Bars
+    recent_bars = st.slider(
+        "Recent bars",
+        min_value=100, max_value=600,
+        step=100, value=300,
+        help="How many of the most recent bars to use as the pattern to match."
+    )
+    # Requirement 2.2: Projection Bars
+    projection_bars = st.slider(
+        "Projection bars",
+        min_value=100, max_value=600,
+        step=100, value=300,
+        help="How many bars into the future to project the historical match."
+    )
+
+    # Requirement 3: Analysis Logic (Backend)
+    # Only the single closest match is shown on this tab, so k=1 keeps the
+    # projection focused on the best historical analogue rather than pooling 30.
+    path = forecast_path_for(
+        cache_key=f"live_{symbol}_{recent_bars}_{projection_bars}",
+        pipe=pipe,
+        length=recent_bars,
+        horizon=projection_bars,
+        k=1,
+        amplitude_weight=M.DEFAULT_AMPLITUDE_WEIGHT,
+        window=None,
+    )
+
+    if path is None:
+        st.warning("Could not find a matching historical pattern for the current price action.")
+        return
+
+    # Requirement 4: Visualization (Frontend)
+    # No aggregate: with k=1 there is only one match, so the median and its
+    # evidence line are suppressed and only the band (which collapses to a point)
+    # and the single closest match are drawn.
+    fig = build_forecast_path_figure(
+        pipe,
+        path,
+        history_bars=recent_bars,
+        title=f"Live Projection for {symbol}",
+        show_median=False,
+    )
+
+    st.plotly_chart(fig, width='stretch')
 
 
 def render_matches_tab(pipe: Pipeline, result: M.MatchResult,
@@ -6499,6 +6608,8 @@ def resolve_ticker(scope: str = "price") -> Optional[ResolvedScope]:
     # A pending fetch from the pass that drew the button.  Popped in one step, because
     # leaving it set would re-download on every subsequent rerun.
     if st.session_state.pop(pending_key, None):
+        # Disable the fetch button while downloading
+        st.session_state["fetch_disabled"] = True
         raw = st.session_state.get(input_key)
         # **The symbol that was *asked for*, recorded before the attempt.**  The
         # failure has to name the thing the reader typed: reporting the error against
@@ -6515,8 +6626,12 @@ def resolve_ticker(scope: str = "price") -> Optional[ResolvedScope]:
             # in-force ticker is kept: a typo should cost the click, not the archive
             # the reader was already looking at.
             FETCH_RESULTS[ticker_key] = _FetchFailure(raw or "", str(exc))
+            # Re-enable the fetch button
+            st.session_state["fetch_disabled"] = False
             return ResolvedScope("app", st.session_state[ticker_key], wanted_tf)
         if not sym:
+            # Re-enable the fetch button
+            st.session_state["fetch_disabled"] = False
             return ResolvedScope("app", st.session_state[ticker_key], wanted_tf)
 
         # ``refresh=True``: pressing Fetch is an explicit request for the latest bars,
@@ -6538,6 +6653,8 @@ def resolve_ticker(scope: str = "price") -> Optional[ResolvedScope]:
             # archive has no such pattern" -- a claim about data that does not exist.
             result.symbol = sym
         FETCH_RESULTS[ticker_key] = result
+        # Re-enable the fetch button
+        st.session_state["fetch_disabled"] = False
 
     return ResolvedScope("app", st.session_state[ticker_key], wanted_tf)
 
@@ -6676,15 +6793,17 @@ def render_ticker_input(scope: str) -> Optional[str]:
         # happened here, and it is why the label is now collapsed and the spacer gone
         # rather than one compensating for the other.
         if st.button(cfg["button_label"], key=fetch_key,
-                     width='stretch', type="primary",
-                     help=cfg["downloaded"].format(
-                         resolve_timeframe(ACTIVE_TIMEFRAME[0]).label,
-                         st.session_state[ticker_key].lower(),
-                         resolve_timeframe(ACTIVE_TIMEFRAME[0]).label.lower())):
+                         width='stretch', type="primary",
+                         help=cfg["downloaded"].format(
+                             resolve_timeframe(ACTIVE_TIMEFRAME[0]).label,
+                             st.session_state[ticker_key].lower(),
+                             resolve_timeframe(ACTIVE_TIMEFRAME[0]).label.lower()),
+                         disabled=st.session_state.get("fetch_disabled", False)):
             # A *non-widget* key, because the button's own key is read-only: writing
             # to it raises.  ``resolve_ticker`` pops this on the next pass, which is
             # where the download and the state reset happen.
             st.session_state[pending_key] = True
+            st.rerun()
 
     # The download itself happened up in ``resolve_ticker``, before the pipelines were
     # built.  Reporting it here -- rather than fetching again -- is what keeps the
@@ -6788,7 +6907,7 @@ def reset_query_state(scope: str, symbol: str) -> None:
     back to Price while they are mid-analysis.
     """
     # Global reset: combine all stale keys.
-    stale = PRICE_STALE_KEYS + FORECAST_STALE_KEYS
+    stale = STALE_KEYS
 
     st.session_state["_"] = {}
     for key in stale:
@@ -7137,6 +7256,13 @@ def main() -> None:
     # written to a plain global earlier in the pass would have exactly one reader.
     ACTIVE_TIMEFRAME[0] = chosen.key
     FORECAST_TIMEFRAME[0] = chosen.key
+    
+    # Initialize fetch disabled state - disable during initial page load
+    if "fetch_disabled" not in st.session_state:
+        st.session_state["fetch_disabled"] = True
+    # Re-enable after initial load if not already enabled by a fetch
+    if st.session_state.get("fetch_disabled", False) and not st.session_state.get("pending_fetch", False):
+        st.session_state["fetch_disabled"] = False
 
     # ---- Resolve both tickers, before anything is drawn -------------------- #
     # **This is the reason the ticker inputs can float above the tabs.**  ``main()``
@@ -7447,6 +7573,8 @@ def main() -> None:
                         forecast_pipe, forecast_symbol,
                         amplitude_weight=cfg["amplitude_weight"],
                     )
+        with tabs[TAB_ORDER.index("Live")]:
+            render_live_tab(pipe, symbol)
         with tabs[TAB_ORDER.index("Backtest")]:
             st.info("Backtesting is disabled until the pipeline is ready.")
         with tabs[TAB_ORDER.index("Panel")]:
@@ -7594,14 +7722,8 @@ def main() -> None:
     tab_price = tab_by_name["Price"]
     tab_matches = tab_by_name["Matches"]
     tab_projection = tab_by_name["Projection"]
-    # Unpacked by name like the rest, and rendered **immediately after**
-    # ``tab_projection`` to match its slot in ``TAB_ORDER``.  The order of the two
-    # ``with`` blocks is not cosmetic: the *Forecast* tab reads the projection horizon
-    # the *Projection* tab's slider resolves, so ``tab_projection`` has to be rendered
-    # first for the read to see this pass's value rather than the previous one.
-    # Reordering these two silently makes the horizon lag an interaction behind, with
-    # no error anywhere.
     tab_forecast = tab_by_name["Forecast"]
+    tab_live = tab_by_name["Live"]
     tab_panel = tab_by_name["Panel"]
     tab_quality = tab_by_name["Quality"]
     tab_backtest = tab_by_name["Backtest"]
@@ -7966,6 +8088,9 @@ def main() -> None:
                     forecast_pipe, forecast_symbol,
                     amplitude_weight=cfg["amplitude_weight"],
                 )
+
+    with tab_live:
+        render_live_tab(pipe, symbol)
 
     with tab_panel:
         # The panel reads its own archive rather than `pipe`, so it is rendered even
