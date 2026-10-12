@@ -165,12 +165,12 @@ def session_et(ts: pd.Series) -> pd.Series:
     return idx.dt.tz_convert(EASTERN).dt.floor("D")
 
 
-def stamp_label(ts: object, tf: object = None) -> str:
+def stamp_label(ts: object, tf: object = None, *, zone: object = None) -> str:
     """One bar's stamp as a reader should read it, at this bar's resolution.
 
     ``2026-09-03 09:30`` intraday, ``2026-09-03`` daily.  **One definition, because
     ``fetch.py``'s summary line and the app's chart axes must not be able to disagree**
-    about what a bar looks like -- a reader comparing the two is exactly how a
+    about what a bar looks like -- a reader comparing the one is exactly how a
     resolution mismatch gets noticed, and only if the two are printed the same way.
 
     Daily drops the time for the same reason :func:`timeseries.timeframes` drops the
@@ -182,6 +182,15 @@ def stamp_label(ts: object, tf: object = None) -> str:
 
     ``tf`` accepts anything :func:`~timeseries.timeframes.resolve_timeframe` does;
     the default is the package default rather than a guess about the caller.
+
+    ``zone`` is the *display* zone.  Bars are stored as UTC and stay that way -- this
+    function never rewrites the archive -- but the clock a reader sees is converted
+    through ``zone`` before formatting, so a reader in Chicago and one in Tokyo read
+    different times for the same bar.  It accepts anything :class:`zoneinfo.ZoneInfo`
+    accepts; ``None`` (the default) leaves the stamp in whatever zone it arrived in,
+    which is UTC for every bar this package produces.  Daily is unaffected: one bar is
+    a whole session, so the time is constant across the archive and is dropped
+    regardless of ``zone``.
     """
     tf = resolve_timeframe(tf) if tf is not None else resolve_timeframe(None)
     if ts is None or ts is pd.NaT:
@@ -191,6 +200,8 @@ def stamp_label(ts: object, tf: object = None) -> str:
         return "—"
     if tf.bars_per_session == 1:
         return session_et(pd.Series([stamp])).iloc[0].strftime("%Y-%m-%d")
+    if zone is not None:
+        stamp = stamp.tz_convert(zone)
     return stamp.strftime("%Y-%m-%d %H:%M")
 
 

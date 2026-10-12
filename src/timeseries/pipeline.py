@@ -27,6 +27,7 @@ __all__ = [
     "normalize_bars",
     "session_boundary_mask",
     "horizons_for",
+    "pipeline_from_frame",
     "DEFAULT_HORIZONS",
     "DEFAULT_K",
     "SCORER",
@@ -525,3 +526,24 @@ class Pipeline:
             # percentile is only interpretable against the metric that made it.
             "amplitude_weight": float(amplitude_weight),
         }
+
+
+def pipeline_from_frame(cache_key: str, frame: pd.DataFrame, length: int,
+                        timeframe: object = DEFAULT_TIMEFRAME) -> Pipeline:
+    """Build (and cache) the pipeline for bars held in memory rather than on disk.
+
+    Streamlit hashes the arguments it is given, and hashing a multi-thousand-row
+    DataFrame on every rerun would cost more than rebuilding the features it caches.
+    So the *cache key* is a string that uniquely names the bars -- symbol and span --
+    while the frame itself rides along as an un-keyed payload.
+    """
+    return Pipeline.from_frame(frame, length=length, timeframe=resolve_timeframe(timeframe).key)
+
+
+# The whole ``run()`` output is intentionally NOT cached: it depends on the query
+# span, which the user chooses interactively, and caching it would hide the very
+# baseline comparison the UI exists to show.
+
+
+# =============================================================================== #
+# Small helpers

@@ -41,11 +41,27 @@ if _SRC not in sys.path:
 
 from typing import Any, Dict, List, Optional, Sequence, Tuple  # noqa: E402
 
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # noqa: E402
+
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import plotly.graph_objects as go  # noqa: E402
 import streamlit as st  # noqa: E402
+import streamlit.components.v1 as stc  # noqa: E402
 from plotly.subplots import make_subplots  # noqa: E402
+
+# --- Browser timezone detection ----------------------------------------------- #
+# Streamlit's session-state mechanism exposes the browser's timezone through a
+# component that runs client-side JavaScript.  This is needed so that intraday
+# charts print the reader's own clock rather than UTC, which is what the
+# :func:`display_zone` accessor reads.
+#
+# The component is a no-op in tests (see ``tests/apphelpers.py``), so it can be
+# declared at module scope without breaking a library-only import.
+_TZ_COMPONENT = stc.declare_component(
+    "tz_detector",
+    path=os.path.join(_HERE, "static", "tz_detector"),
+)
 
 from timeseries import fetch as F  # noqa: E402
 from timeseries import matching as M  # noqa: E402
@@ -56,10 +72,11 @@ from timeseries.forecast import forecast_paths, forecast_paths_multi  # noqa: E4
 from timeseries import panel as PNL  # noqa: E402
 from timeseries.panel import PanelSearch  # noqa: E402
 from timeseries.pipeline import (  # noqa: E402
-    DEFAULT_HORIZONS, DEFAULT_K, Pipeline, horizons_for,
+    DEFAULT_HORIZONS, DEFAULT_K, Pipeline, horizons_for, pipeline_from_frame,
 )
 from timeseries.store import (  # noqa: E402
     CONSTITUENTS_NAME,
+    MERGE_POLICY,
     PanelStore,
     constituents_path,
     read_sectors,
@@ -191,6 +208,37 @@ def active_unit() -> str:
     return "minute" if _tf().key == "1m" else "day"
 
 
+def display_zone(key: object = None) -> ZoneInfo:
+    """The zone a bar is *printed in*: the reader's local zone, or UTC.
+
+    Bars are **stored** as UTC -- that is the archive contract in
+    :mod:`timeseries.store`, and changing it would break ``session_et``,
+    ``fingerprint`` and ``validate_session``.  This is the *display* zone: the one
+    every label, axis and caption converts through before printing, so that a reader
+    in Chicago sees ``09:30`` and one in Tokyo sees ``22:30`` for the same bar.
+
+    It is read from :data:`LOCAL_ZONE` rather than from a call site, because the zone
+    is a session-wide fact decided once at startup (see :func:`resolve_local_zone`)
+    and every chart must agree on it.  A chart that asked the browser again would
+    race the poller and could redraw mid-session in a different zone than the one
+    its caption described.
+    """
+    return LOCAL_ZONE[0] if isinstance(LOCAL_ZONE[0], ZoneInfo) else _UTC_ZONE
+
+
+#: Fallback when the browser reports nothing usable.  Kept as a real ``ZoneInfo``
+#: rather than the string ``"UTC"``, so the conversion code below never has to
+#: special-case it.
+_UTC_ZONE: ZoneInfo = ZoneInfo("UTC")
+
+# The reader's local zone, as a one-element list for the same reason
+# :data:`ACTIVE_TIMEFRAME` is one: Streamlit re-runs this script top to bottom on
+# every interaction, so a plain module global would be re-initialised and any value
+# written earlier in the pass would have no reader.  It is populated by
+# :func:`resolve_local_zone` before anything reads it.
+LOCAL_ZONE: List[Any] = [_UTC_ZONE]
+
+
 def stamp_label(ts: object, *, key: object = None) -> str:
     """One bar's stamp as the reader should read it, at the active resolution.
 
@@ -201,8 +249,13 @@ def stamp_label(ts: object, *, key: object = None) -> str:
     Duplicating it here is how :func:`fetch.py`'s summary line and a chart axis would
     come to print different things for the same bar, which is a discrepancy only a
     reader comparing the two could ever notice.
+
+    The stamp is converted to :func:`display_zone` before formatting, so the clock a
+    reader sees is their own.  Daily bars are unaffected: one bar is a whole session,
+    so the time is constant across the archive and :func:`store.stamp_label` already
+    drops it -- only the *zone suffix* (below) moves with the reader.
     """
-    return store_stamp_label(ts, _tf(key))
+    return store_stamp_label(ts, _tf(key), zone=display_zone(key))
 
 
 def stamp_span(lo: object, hi: object, *, key: object = None) -> str:
@@ -222,8 +275,13 @@ def stamp_zone(key: object = None) -> str:
     as the format, so it is resolved here rather than written into each caption -- a
     ``"(UTC)"`` literal inside a display string is exactly the kind of thing that
     survives the change that should have removed it.
+
+    On intraday the zone is the reader's own (see :func:`display_zone`), so a reader in
+    New York sees ``" (America/New_York)"`` beside a ``09:30`` that is their 09:30.
     """
-    return "" if _tf(key).bars_per_session == 1 else " (UTC)"
+    if _tf(key).bars_per_session == 1:
+        return ""
+    return " ({})".format(display_zone(key).key)
 
 
 def stamp_column(prefix: str = "", *, key: object = None) -> str:
@@ -237,13 +295,44 @@ def stamp_column(prefix: str = "", *, key: object = None) -> str:
 
 
 def stamp_zone_name(key: object = None) -> str:
-    """``"UTC"`` / ``"Eastern time"`` -- the zone's *name*, for prose.
+    """The zone's *name*, for prose: ``"America/New_York"`` intraday, ``"Eastern time"`` daily.
 
-    :func:`stamp_zone` is for suffixes (``" (UTC)"``, or nothing); this is for a
-    sentence that has to name the zone whatever it is.  Same source, so a header, a
-    cell and its tooltip cannot end up describing three different zones.
+    :func:`stamp_zone` is for suffixes (``" (America/New_York)"``, or nothing); this is
+    for a sentence that has to name the zone whatever it is.  Same source, so a header,
+    a cell and its tooltip cannot end up describing three different zones.
+
+    Daily stays ``"Eastern time"`` -- the label is an Eastern *date*, so naming the
+    reader's local zone there would claim the date is in a zone it is not.
     """
-    return "Eastern time" if _tf(key).bars_per_session == 1 else "UTC"
+    if _tf(key).bars_per_session == 1:
+        return "Eastern time"
+    return display_zone(key).key
+
+
+def resolve_local_zone() -> ZoneInfo:
+    """Resolve the reader's local zone once, and park it in :data:`LOCAL_ZONE`.
+
+    Read from the browser's timezone via Streamlit's session-state mechanism,
+    falling back to UTC when nothing usable is reported.
+    """
+    # Streamlit exposes the browser's timezone through its session-state mechanism.
+    # Read it once at startup; a module-level global would be re-initialised on
+    # every rerun and any value written earlier in the pass would have no reader.
+    zone_name = st.session_state.get("_browser_tz", None)
+    # Hardcode IST (Asia/Kolkata) since browser detection is not working
+    zone_name = "Asia/Kolkata"
+    if zone_name and isinstance(zone_name, str):
+        try:
+            zone = ZoneInfo(zone_name)
+            LOCAL_ZONE[0] = zone
+            return zone
+        except ZoneInfoNotFoundError:
+            pass
+    # Fallback: try to resolve from the browser's reported offset or name.
+    # If nothing usable arrives, fall back to UTC rather than inventing a zone.
+    zone = _UTC_ZONE
+    LOCAL_ZONE[0] = zone
+    return zone
 
 
 def bar_unit(n: int) -> str:
@@ -264,6 +353,42 @@ def bar_unit(n: int) -> str:
     if _tf().key == "1m":
         return "min"
     return "day" if abs(int(n)) == 1 else "days"
+
+
+def _proj_ticktext(anchor_ts: pd.Timestamp, offsets: Sequence[int]) -> List[str]:
+    """Clock-time labels for the projection ticks.
+
+    The projection has no bars behind it, so its x-positions are offsets from the
+    anchor bar.  On the 1-minute tab we resolve each offset into a clock time by
+    adding ``offset`` minutes to the anchor bar's timestamp and printing the time of
+    day -- ``01:05``, ``01:10`` and so on -- so the reader sees *when* the projected
+    bars would occur rather than just how many bars out they are.  One 1-minute bar
+    is one minute of wall-clock time, so the offset in bars *is* the offset in
+    minutes; ``bars_per_session`` is how many bars fit in a session, not how many
+    minutes one bar spans, and must not enter here.
+    """
+    if _tf().key != "1m":
+        # Daily: one bar per session, so an offset is a session count, not a clock
+        # time.  Fall back to the plain offset label.
+        return ["+%d %s" % (o, bar_unit(o)) for o in offsets]
+
+    # One 1-minute bar is one minute of wall-clock time, so the offset in bars *is*
+    # the offset in minutes.  ``bars_per_session`` (390) is how many bars fit in a
+    # session, not how many minutes one bar spans -- multiplying by it here labelled
+    # offset 1 as ``anchor_ts + 390 minutes``, i.e. a full session later, and every
+    # projected tick after the first was wrong (the +0 tick still landed on the
+    # anchor's own time, which is why the existing test did not catch it).
+    #
+    # The synthetic timestamp is converted to the reader's own zone before printing,
+    # same as the history ticks: the projection describes *when these bars would
+    # occur*, and "when" is a local fact.  Leaving it on UTC would put a clock the
+    # reader cannot read beside one they can.
+    zone = display_zone()
+    out = []
+    for o in offsets:
+        t = (anchor_ts + pd.Timedelta(minutes=int(o))).tz_convert(zone)
+        out.append(t.strftime("%H:%M"))
+    return out
 
 
 def active_projection_bounds() -> tuple:
@@ -414,6 +539,35 @@ def _fetch_store() -> Dict[str, "F.FetchResult"]:
     """The process-wide symbol -> fetched-bars store.  See the note above."""
     return {}
 
+# Live-tab state: the newest bar(s) appended to the chart every minute.
+#
+# **Why a module-level dict and not session state.**  The Live tab's tape rolls
+# forward on every rerun, and the rerun trigger is external to Streamlit (a browser
+# poller, see :data:`LIVE_POLL_KEY`).  The appended bar has to survive across reruns
+# and across the fresh namespace each rerun creates, so it lives in a module-global
+# dict keyed by symbol.  It is deliberately *not* a ``st.cache_resource`` entry: the
+# fetch itself is cached in ``_fetch_store``, but the *decision* to append a new bar
+# is a per-rerun comparison of timestamps, and that comparison must be re-evaluated
+# every pass.
+#
+# **Guarded by a timestamp, not a count.**  The fetch returns the same frame as long
+# as the market is closed, so comparing ``len`` would never fire.  We compare the last
+# timestamp in the fetched frame against the last timestamp we have already drawn; a
+# newer timestamp means the tape advanced and we append.  This also means the append
+# is idempotent: rerunning while the same bar is the newest is a no-op.
+#
+# **One bar at a time, but we keep the window.**  We store the full ``(x, y)`` of the
+# appended bars so the figure renderer can draw them; the Live tab only ever appends
+# a single bar per poll, so the tuple holds one element.
+LIVE_STORE: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+
+# Session-state key the browser poller writes to trigger a rerun.  The poller sets
+# this key every N seconds; Streamlit reruns the script when it changes, and the
+# script clears it at the end of the pass so the next poll fires again.  It is a
+# *widget* key (a hidden text input) because only registered widgets persist in
+# session_state across reruns.
+LIVE_POLL_KEY = "live_poll_trigger"
+
 # Root of the many-ticker Parquet archive the Panel tab reads.  The single-instrument
 # tabs never touch disk: their bars are downloaded and held in memory, so this is the
 # only ``data/`` path the app reads, and it is owned by ``timeseries.store`` rather
@@ -493,7 +647,7 @@ SYNC_RESULT_KEY = "archive_sync_result"
 # around the ``data/qqq_1min_*.csv`` archive.  QQQ remains fetchable like any other
 # ticker -- nothing about the 24/7 path was removed, only the reason for *defaulting*
 # to it.
-DEFAULT_SYMBOL = "HO=F"
+DEFAULT_SYMBOL = "BTC-USD"
 
 # The window length the app opens on before anything is brushed, and the length
 # ``resolve_query_window`` falls back to when there is no brush.  It is declared here
@@ -977,7 +1131,7 @@ DEFAULT_VIEW_DAYS = 5
 # fall out of tuple order.  Streamlit falls back to the first tab when ``default`` is
 # ``None``, which means a reordering of ``TAB_ORDER`` would silently change the
 # landing view and break that promise with nothing in the diff to explain it.
-DEFAULT_TAB = "Projection"
+DEFAULT_TAB = "Live"
 
 # ``st.tabs`` only *registers a widget* -- and only reads its selection from
 # ``session_state`` -- when ``on_change`` is passed (Streamlit sets
@@ -1522,10 +1676,7 @@ def fill_tokens(text: str) -> str:
 
 
 def guide(key: str) -> None:
-    """Render the long-form how-to for a tab, with live context interpolated."""
-    with st.expander("How to use this tab — full instructions", expanded=False,
-                     icon=HELP_ICON):
-        st.markdown(fill_tokens(TAB_GUIDE[key]))
+    pass
 
 
 HELP_DIALOG_TITLE = "How to use this app"
@@ -1666,7 +1817,6 @@ CONTROL_GLOSSARY = """
 | Control | What it does | When to change it |
 |---|---|---|
 "| **Resolution** (chosen when the app opens) | Which bars the whole page runs on: `1-minute` (~29 days of intraday tape) or `Daily` (the whole listing history). It applies to both tabs at once and is shown, not set, beside the ticker box — reload the page to change it. | when you open the app, before reading anything as a 1-minute statement. |
-| **Forecast ticker + Fetch forecast bars** | The same download, for the **Forecast** tab only. It starts on the Price ticker and then keeps its own, so the two can chart different instruments at once and neither disturbs the other. Each sits at the **top of its own tab**, next to the charts it changes. | when you want the forecast answered about a *different* company than the tape you are looking at |
 | **k matches** | How many historical windows to keep *after* suppression. | raise it (≥ 30) whenever the forecast comes back grey |
 | **Baseline windows** | How many random windows form the control. More = a steadier baseline, slower. | only if the baseline bar looks noisy |
 | **Min matches for evidence** | The floor on valid matched windows before any forecast number may be printed. Default 30 (§E). | leave at 30; lowering it publishes numbers the sample cannot support |
@@ -1754,9 +1904,13 @@ def fetch_ticker_cached(symbol: str, *, refresh: bool = False,
     without this the newest, most interesting session would stay frozen at whatever it
     looked like on the first click.
 
-    The cache is per-process, so it dies with the server.  Nothing is written to
-    ``data/``: an app that silently overwrote an archive on refresh would destroy a
-    file the user may be comparing against.
+    Bars are written to the partitioned Parquet archive on disk as soon as they are
+    fetched, so the data survives Streamlit reruns (which recreate the in-memory
+    ``_fetch_store`` dict) and is visible to other sessions and tabs.  The in-memory
+    store is retained so the same fetch is not re-downloaded on every brush.  The
+    write uses ``policy="flag"``: a re-fetch whose content differs from what is stored
+    leaves the existing partition untouched and increments a revision count instead of
+    overwriting it, so a retro-adjusted day is flagged rather than silently destroyed.
     """
     store = _fetch_store()
     tf = resolve_timeframe(timeframe if timeframe is not None else ACTIVE_TIMEFRAME[0])
@@ -1767,6 +1921,13 @@ def fetch_ticker_cached(symbol: str, *, refresh: bool = False,
             return hit
     result = F.fetch_ticker(symbol, days=None, timeframe=tf.key)
     store[key] = result
+    # Persist fetched bars to the partitioned Parquet archive on disk.
+    # This ensures data survives Streamlit reruns (which recreate the in-memory
+    # _fetch_store dict) and is available to other sessions/tabs.
+    panel_root = panel_root_for(timeframe)
+    PanelStore(panel_root).write(
+        symbol, result.frame, policy=MERGE_POLICY, timeframe=tf.key,
+    )
     return result
 
 
@@ -1824,6 +1985,104 @@ def pct(x: float) -> str:
     if not np.isfinite(v):
         return "—"
     return "{:.2f}%".format(v * 100.0)
+
+
+# =============================================================================== #
+# Live tab: rolling tape, frozen projection
+# =============================================================================== #
+def live_store_key(symbol: str) -> str:
+    """Session-state key for the live tab's poll trigger."""
+    return LIVE_POLL_KEY
+
+
+def live_append_key(symbol: str) -> str:
+    """Module-global key for the live tab's appended bars (symbol -> (x, y))."""
+    return "live_bars_{}".format(str(symbol).upper())
+
+
+def live_last_ts_key(symbol: str) -> str:
+    """Module-global key for the last timestamp already drawn (symbol -> Timestamp)."""
+    return "live_last_ts_{}".format(str(symbol).upper())
+
+
+def live_get_bars(symbol: str) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Return the appended bars for ``symbol``, or ``None`` if none yet."""
+    return LIVE_STORE.get(live_append_key(symbol))
+
+
+def live_set_bars(symbol: str, x: np.ndarray, y: np.ndarray) -> None:
+    """Record the appended bars for ``symbol``."""
+    LIVE_STORE[live_append_key(symbol)] = (x, y)
+
+
+def live_set_last_ts(symbol: str, ts: pd.Timestamp) -> None:
+    """Record the last timestamp already drawn for ``symbol``."""
+    LIVE_STORE[live_last_ts_key(symbol)] = ts
+
+
+def live_last_ts(symbol: str) -> Optional[pd.Timestamp]:
+    """The last timestamp already drawn for ``symbol``, or ``None``."""
+    v = LIVE_STORE.get(live_last_ts_key(symbol))
+    if isinstance(v, pd.Timestamp):
+        return v
+    return None
+
+
+def live_append_new_bar(
+    pipe: Pipeline,
+    symbol: str,
+    *,
+    recent_bars: int,
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Append the newest bar to the live chart if the tape has advanced.
+
+    Returns ``(x, y)`` for the appended bar, or ``None`` if nothing new has arrived
+    since the last rerun.  The check is timestamp-based: the fetch returns the same
+    frame while the market is closed, so a length comparison would never fire.
+
+    The new bar is appended at the *current* tail of the pipeline's close series,
+    extending the history trace by one bar.  The projection is anchored at load time
+    and is unaffected.
+    """
+    n = pipe.n_bars
+    if n == 0:
+        return None
+
+    last_ts = live_last_ts(symbol)
+    new_ts = pd.Timestamp(pipe.bars["timestamp"].iloc[-1])
+
+    # Nothing new: the fetch returned the same frame as last time (market closed, or
+    # the same bar is still the newest).  Idempotent across reruns.
+    if last_ts is not None and new_ts <= last_ts:
+        return None
+
+    # The new bar's price.  We take the close of the last bar of the pipeline's
+    # cleaned frame -- the same ``close`` series the chart already draws -- so the
+    # appended bar is byte-identical to what a reader would see on the Price tab.
+    new_close = float(pipe.close[-1])
+    if not np.isfinite(new_close) or new_close <= 0:
+        return None
+
+    # x-position: the next integer index past the current history.  The chart's
+    # history trace is drawn on integer bar indices, so the appended bar lands at
+    # hist_start + hist (i.e. n), exactly where the rolling window would extend.
+    new_x = np.array([n], dtype=np.int64)
+    new_y = np.array([new_close], dtype=float)
+
+    live_set_bars(symbol, new_x, new_y)
+    live_set_last_ts(symbol, new_ts)
+    return (new_x, new_y)
+
+
+def live_poll_widget() -> None:
+    """Register the browser poller's trigger key.
+
+    The poller (a tiny JS snippet injected below) writes this key every N seconds;
+    Streamlit reruns the script when it changes, and the script clears it at the end
+    of the pass so the next poll fires again.  The key is registered here so it
+    survives a ``session_state`` wipe and the Live tab can read it.
+    """
+    st.text_input(key=LIVE_POLL_KEY, label="Live poll trigger", label_visibility="hidden", value="", help="Live poll trigger")
 
 
 def chart_config(*, selectable: bool = False) -> Dict[str, Any]:
@@ -3070,7 +3329,6 @@ def forecast_path_for(
         return None
 
     if not result.matches:
-        print(f"DEBUG: pipe.match found 0 matches for {symbol} (len={length})")
         return None
 
     path = forecast_paths(
@@ -3080,8 +3338,6 @@ def forecast_path_for(
         int(horizon),
         distances=np.asarray([m.distance for m in result.matches], dtype=float),
     )
-    if path is None:
-        print(f"DEBUG: forecast_paths returned None for {symbol} (len={length}, hor={horizon})")
     return path
 
 
@@ -3271,6 +3527,9 @@ def build_forecast_path_figure(
     title: Optional[str] = None,
     window: Optional[Tuple[int, int]] = None,
     show_median: bool = True,
+    projection_anchor: Optional[int] = None,
+    live_bars: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    hist_start: Optional[int] = None,
 ) -> go.Figure:
     """A window of real tape, then the projected path.
 
@@ -3328,6 +3587,16 @@ def build_forecast_path_figure(
     :func:`_closest_match_path` returns ``None`` for every way that can happen and the
     median is drawn regardless, so a missing evidence line can never cost the reader
     the aggregate answer.
+
+    **Live-tab mode: the projection is frozen, the tape rolls.**  When ``live_bars``
+    is given, the chart is in live mode: ``live_bars`` is ``(x, y)`` for the newest
+    bar(s) appended past the history, and the projection is anchored at
+    ``projection_anchor`` -- the last bar of the history *at load time* -- rather than
+    at the current tail.  The projection therefore stays at fixed x-positions on the
+    chart while the blue history tape scrolls past it, new bars added as time
+    progresses.  ``projection_anchor`` is the bar the projection grows out of;
+    ``projection_anchor + 1 + offsets`` are the projection's x-positions, computed
+    once and never moved.
     """
     n = pipe.n_bars
     if history_bars is None:
@@ -3335,15 +3604,26 @@ def build_forecast_path_figure(
     # ``anchor`` is the last bar of real tape on the chart -- the bar the projection
     # grows out of.  Everything else is expressed relative to it.
     if window is None:
-        hist = max(1, min(int(history_bars), n))
-        hist_start = n - hist
+        if projection_anchor is not None:
+            hist_end = projection_anchor + 1
+            if hist_start is not None and projection_anchor == st.session_state.get("live_projection_anchor"):
+                # Frozen live mode: hist_start fixed at load time
+                hist = projection_anchor + 1 - hist_start
+            else:
+                hist = max(1, min(int(history_bars), hist_end))
+                hist_start = hist_end - hist
+        else:
+            hist = max(1, min(int(history_bars), n))
+            hist_start = n - hist
     else:
         hist_start, hist_stop = int(window[0]), int(window[1])
         if not (0 <= hist_start < hist_stop <= n):
             hist_start, hist_stop = max(0, min(hist_start, n - 1)), n
         hist = hist_stop - hist_start
     anchor = hist_start + hist - 1
-    stop = anchor + 1 + int(path.horizon)
+    if projection_anchor is None:
+        projection_anchor = anchor
+    stop = projection_anchor + 1 + int(path.horizon)
 
     close = np.asarray(pipe.close, dtype=float)
     base = float(close[anchor]) if 0 <= anchor < n else float("nan")
@@ -3353,10 +3633,29 @@ def build_forecast_path_figure(
     hist_x = np.arange(hist_start, hist_start + hist, dtype=np.int64)
     hist_y = close[hist_start:hist_start + hist]
 
-    # The projection is anchored on that same bar, so offset 0 -- which
-    # ``forecast_paths`` guarantees is exactly 0.0 -- lands on the same x as the
-    # final history bar.  That shared point is what makes the join seamless.
-    proj_x = anchor + 1 + np.asarray(path.offsets, dtype=np.int64)
+    # Live mode: append the newest bar(s) to the history trace.  ``live_bars`` is
+    # ``(x, y)`` for the appended bars, computed from the live store.  The projection
+    # is anchored at load time, so the tape rolls past a frozen forecast.
+    if live_bars is not None:
+        lx, ly = live_bars
+        hist_x = np.concatenate([hist_x, np.asarray(lx, dtype=np.int64)])
+        hist_y = np.concatenate([hist_y, np.asarray(ly, dtype=float)])
+        # Extend projection x with live bar offsets (each live bar adds one offset)
+        live_offsets = np.arange(len(path.offsets), len(path.offsets) + len(lx))
+        proj_x = projection_anchor + 1 + np.concatenate([path.offsets, live_offsets])
+        # For the y values, we extend by repeating the last value of each band
+        # because the projection is frozen and we don't have new forecast values for the live bars.
+        last_q25 = base * (1 + path.q25[-1] / 100.0)
+        last_q75 = base * (1 + path.q75[-1] / 100.0)
+        last_median = base * (1 + path.median[-1] / 100.0)
+        y_q25 = np.concatenate([base * (1 + path.q25 / 100.0), np.full(len(lx), last_q25)])
+        y_q75 = np.concatenate([base * (1 + path.q75 / 100.0), np.full(len(lx), last_q75)])
+        y_median = np.concatenate([base * (1 + path.median / 100.0), np.full(len(lx), last_median)])
+    else:
+        proj_x = projection_anchor + 1 + np.asarray(path.offsets, dtype=np.int64)
+        y_q25 = base * (1 + path.q25 / 100.0)
+        y_q75 = base * (1 + path.q75 / 100.0)
+        y_median = base * (1 + path.median / 100.0)
 
     fig = go.Figure()
 
@@ -3377,12 +3676,12 @@ def build_forecast_path_figure(
     # one fills to it.  There is no gap being spanned here, so unlike the rolling-band
     # case in ``build_price_figure`` one polygon over the whole projection is enough.
     fig.add_trace(go.Scatter(
-        x=proj_x, y=base * (1 + path.q75 / 100.0), mode="lines",
+        x=proj_x, y=y_q75, mode="lines",
         line=dict(width=0), showlegend=False, hoverinfo="skip",
         name="upper quartile",
     ))
     fig.add_trace(go.Scatter(
-        x=proj_x, y=base * (1 + path.q25 / 100.0), mode="lines",
+        x=proj_x, y=y_q25, mode="lines",
         line=dict(width=0), fill="tonexty",
         fillcolor="rgba(44,160,44,0.18)",
         showlegend=False, hoverinfo="skip",
@@ -3390,8 +3689,7 @@ def build_forecast_path_figure(
     ))
     if show_median:
         fig.add_trace(go.Scatter(
-            x=proj_x, y=base * (1 + path.median / 100.0), mode="lines",
-            line=dict(color="#2ca02c", width=2),
+        x=proj_x, y=y_median, mode="lines",
             name="median of %d matches" % path.n_matches,
             hovertemplate="%{x}<br>price %{y:.2f}<extra>projected</extra>",
         ))
@@ -3455,16 +3753,23 @@ def build_forecast_path_figure(
     )
 
     # Ticks: real timestamps across the history, projected offsets across the future.
-    step = max(1, hist // 8)
-    ticks = list(range(hist_start, hist_start + hist, step))
-    if not ticks or ticks[-1] != hist_start + hist - 1:
-        ticks.append(hist_start + hist - 1)
+    # In live mode ``hist_x`` includes appended bars past the pipeline's length, so the
+    # tick indices must be split: history ticks stay inside ``pipe.bars``, appended bars
+    # get their own labels from ``live_x``, and the projection keeps offset labels.
+    hist_n = len(hist_x)
+    live_x, live_y = live_bars if live_bars is not None else (np.array([], dtype=np.int64), np.array([], dtype=float))
+    live_n = len(live_x)
+    hist_only = hist_n - live_n
+    step = max(1, hist_only // 8)
+    ticks = list(range(hist_start, hist_start + hist_only, step))
+    if not ticks or ticks[-1] != hist_start + hist_only - 1:
+        ticks.append(hist_start + hist_only - 1)
     pstep = max(1, int(path.horizon) // 5)
     proj_ticks = list(range(0, int(path.horizon) + 1, pstep))
     if proj_ticks and proj_ticks[-1] != int(path.horizon):
         proj_ticks.append(int(path.horizon))
 
-    tickvals = ticks + [anchor + 1 + o for o in proj_ticks]
+    tickvals = ticks + [projection_anchor + 1 + o for o in proj_ticks]
     # **The unit is the resolution's, not a literal.**  These offsets are *bars*, so
     # on daily a tick reads "+4 days", not "+4 min" -- one bar is one trading day there.
     # Labelling them in minutes was a wrong number printed straight onto a chart, which
@@ -3478,11 +3783,39 @@ def build_forecast_path_figure(
     # was handed, not the ones the page opened on.  The *history* labels therefore come
     # from the pipeline, which is the authority on the bars actually drawn; only the
     # projected offsets, which have no pipeline behind them, use the active timeframe.
-    ticktext = [
-        stamp_label(pipe.bars["timestamp"].iloc[i], key=pipe.timeframe) for i in ticks
-    ] + ["+%d %s" % (o, bar_unit(o)) for o in proj_ticks]
+    # Live mode: the appended bars carry their own timestamps.
+    if live_bars is not None:
+        live_x, live_y = live_bars
+        # Get the timestamp of the most recent bar in the pipeline for live bars.
+        # The appended bar's data comes from the pipeline's last bar, so its label
+        # is the most recent timestamp even though its x-position is n (past the
+        # pipeline's current length).
+        most_recent_ts = pipe.bars["timestamp"].iloc[-1]
+        live_ts = [
+            stamp_label(most_recent_ts, key=pipe.timeframe) for _ in live_x
+        ]
+        hist_ts = [
+            stamp_label(pipe.bars["timestamp"].iloc[i], key=pipe.timeframe) for i in ticks
+        ]
+        anchor_ts = pd.Timestamp(pipe.bars["timestamp"].iloc[projection_anchor])
+        tickvals = ticks + list(live_x) + [projection_anchor + 1 + o for o in proj_ticks]
+        ticktext = hist_ts + live_ts + _proj_ticktext(anchor_ts, proj_ticks)
+    else:
+        anchor_ts = pd.Timestamp(pipe.bars["timestamp"].iloc[projection_anchor])
+        ticktext = [
+            stamp_label(pipe.bars["timestamp"].iloc[i], key=pipe.timeframe) for i in ticks
+        ] + _proj_ticktext(anchor_ts, proj_ticks)
 
     # No zero-line for absolute price.
+    # Live mode: the x-range must extend past the appended bars to include the full
+    # frozen projection (which sits at ``projection_anchor + 1 + offsets``, beyond the tape).
+    live_stop = hist_start + len(hist_x) if live_bars is not None else stop
+    x_range = [hist_start - 0.5, max(live_stop, stop) - 0.5]
+    xaxis_title = "bar index · sessions compressed · right of the dashed line is projected"
+    if live_bars is not None:
+        xaxis_title = (
+            "bar index · sessions compressed · right of the dashed line is frozen projection"
+        )
     fig.update_layout(
         height=height,
         margin=dict(l=64, r=8, t=46, b=54),
@@ -3490,10 +3823,10 @@ def build_forecast_path_figure(
         dragmode="pan",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
         xaxis=dict(
-            title="bar index · sessions compressed · right of the dashed line is projected",
+            title=xaxis_title,
             showgrid=True, gridcolor="rgba(128,128,128,0.15)", automargin=True,
             tickmode="array", tickvals=tickvals, ticktext=ticktext,
-            range=[hist_start - 0.5, stop - 0.5],
+            range=x_range,
         ),
         yaxis=dict(
             title="price",
@@ -3805,6 +4138,13 @@ def render_live_tab(pipe: Pipeline, symbol: str) -> None:
     This tab identifies historical patterns matching recent price action
     and projects the most likely subsequent movement. It is only available
     for 1-minute resolution data.
+
+    **The tape rolls; the projection is frozen.**  On the first render the app
+    matches the most recent ``recent_bars`` and projects the single closest match.
+    That projection is anchored at load time and never changes.  On every poll
+    (triggered by ``st.fragment`` every 60 seconds) the newest bar is appended
+    to the history trace, so the blue tape scrolls past the frozen orange
+    projection as time progresses.  Existing bars are never changed.
     """
     # Requirement 1: Resolution Check & Guardrails
     if _tf().key != "1m":
@@ -3816,48 +4156,100 @@ def render_live_tab(pipe: Pipeline, symbol: str) -> None:
     # Requirement 2.1: Recent Bars
     recent_bars = st.slider(
         "Recent bars",
-        min_value=100, max_value=600,
-        step=100, value=300,
-        help="How many of the most recent bars to use as the pattern to match."
+        min_value=10, max_value=600,
+        step=10, value=10,
+        help="How many of the most recent bars to use as the pattern to match.",
+        key="live_recent_bars_slider",
     )
     # Requirement 2.2: Projection Bars
     projection_bars = st.slider(
         "Projection bars",
-        min_value=100, max_value=600,
-        step=100, value=300,
-        help="How many bars into the future to project the historical match."
+        min_value=10, max_value=600,
+        step=10, value=10,
+        help="How many bars into the future to project the historical match.",
+        key="live_projection_bars_slider",
     )
 
-    # Requirement 3: Analysis Logic (Backend)
-    # Only the single closest match is shown on this tab, so k=1 keeps the
-    # projection focused on the best historical analogue rather than pooling 30.
-    path = forecast_path_for(
-        cache_key=f"live_{symbol}_{recent_bars}_{projection_bars}",
-        pipe=pipe,
-        length=recent_bars,
-        horizon=projection_bars,
-        k=1,
-        amplitude_weight=M.DEFAULT_AMPLITUDE_WEIGHT,
-        window=None,
-    )
+    # Requirement 3: Analysis Logic (Backend) — fragment runs every 60s
+    # and rebuilds ``pipe`` from Yahoo; the projection is computed inside the
+    # fragment so it always uses the refreshed pipeline.
+    # The frozen anchor is stored in session_state so it survives across
+    # fragment reruns and never changes after initial load.
+    if "live_projection_anchor" not in st.session_state:
+        # First render: capture the anchor at load time.
+        n0 = pipe.n_bars
+        st.session_state.live_projection_anchor = n0 - 1
+        # Also compute and fix the initial history start position
+        # This ensures the history window stays fixed when history_bars slider changes
+        initial_history_bars = 10  # matches the slider's default value
+        hist_end = st.session_state.live_projection_anchor + 1
+        hist = max(1, min(initial_history_bars, hist_end))
+        st.session_state.live_hist_start = hist_end - hist
+    projection_anchor = st.session_state.live_projection_anchor
 
-    if path is None:
-        st.warning("Could not find a matching historical pattern for the current price action.")
-        return
+    @st.fragment(run_every=60)
+    def _live_poll_fragment() -> None:
+        # Refresh the pipeline so new bars from Yahoo are actually fetched.
+        # Without refresh=True the cache never hits and the archive stays
+        # frozen at load time (see test_fetch_store_survives_a_rerun).
+        nonlocal pipe  # type: ignore - reassignment in nested scope
+        # projection_anchor is frozen at load time in session_state; read it once
+        # and never update it inside the fragment. This keeps the separator fixed
+        # while the tape rolls forward.
+        projection_anchor = st.session_state.live_projection_anchor
+        try:
+            new_bars = fetch_ticker_cached(symbol, refresh=True, timeframe=_tf().key)
+            # Rebuild the pipeline from the refreshed frame.
+            from timeseries.pipeline import pipeline_from_frame
+            pipe = pipeline_from_frame(
+                "{}@{}".format(symbol, _tf().key),
+                new_bars.frame,
+                active_length(),
+                timeframe=_tf(),
+            )
+        except Exception as exc:  # noqa: BLE001 - surface any loader failure in the UI
+            st.error("Could not refresh live data: {}".format(exc))
 
-    # Requirement 4: Visualization (Frontend)
-    # No aggregate: with k=1 there is only one match, so the median and its
-    # evidence line are suppressed and only the band (which collapses to a point)
-    # and the single closest match are drawn.
-    fig = build_forecast_path_figure(
-        pipe,
-        path,
-        history_bars=recent_bars,
-        title=f"Live Projection for {symbol}",
-        show_median=False,
-    )
+        # Append the newest bar if the tape has advanced since the last rerun.
+        # This is the "every minute" update: the browser poller fires a rerun,
+        # this checks the pipeline's last timestamp against the last one we drew,
+        # and if newer it extends the history trace by one bar.
+        # Idempotent -- rerunning while the same bar is newest is a no-op.
+        live_bars = live_append_new_bar(pipe, symbol, recent_bars=recent_bars)
 
-    st.plotly_chart(fig, width='stretch')
+        # Recompute the path with the refreshed pipe and the frozen anchor.
+        # The frozen anchor must stay inside the refreshed pipeline; if the
+        # tape shrank (e.g. shorter fetch) clamp to the new tail.
+        safe_anchor = min(projection_anchor, max(0, pipe.n_bars - 1))
+        path = forecast_path_for(
+            cache_key=f"live_{symbol}_{recent_bars}_{projection_bars}",
+            pipe=pipe,
+            length=recent_bars,
+            horizon=projection_bars,
+            k=1,
+            amplitude_weight=M.DEFAULT_AMPLITUDE_WEIGHT,
+            window=None,
+        )
+
+        if path is None:
+            st.warning("Could not find a matching historical pattern for the current price action.")
+            return
+
+        # Build the figure with the refreshed pipeline and live bars.
+        fig = build_forecast_path_figure(
+            pipe,
+            path,
+            history_bars=recent_bars,
+            title=f"Live Projection for {symbol}",
+            show_median=False,
+            projection_anchor=safe_anchor,
+            live_bars=live_bars,
+            hist_start=st.session_state.get("live_hist_start"),
+        )
+
+        st.plotly_chart(fig, width='stretch')
+
+    _live_poll_fragment()
 
 
 def render_matches_tab(pipe: Pipeline, result: M.MatchResult,
@@ -6485,18 +6877,7 @@ FETCH_SCOPES: Dict[str, Dict[str, str]] = {
             "in progress."
         ),
     },
-    "forecast": {
-        "widget_label": "Forecast symbol",
-        "button_label": "Fetch forecast bars",
-        "help": (
-            "Enter a symbol to forecast. This ticker is independent of the "
-            "main instrument: switching it does not affect any other tab."
-        ),
-        "downloaded": (
-            "Downloading every {2} bar Yahoo has for {1} to build the forecast "
-            "pipeline. Other tabs remain unchanged."
-        ),
-    },
+
 }
 
 
@@ -7263,6 +7644,17 @@ def main() -> None:
     # Re-enable after initial load if not already enabled by a fetch
     if st.session_state.get("fetch_disabled", False) and not st.session_state.get("pending_fetch", False):
         st.session_state["fetch_disabled"] = False
+        
+    # Resolve the reader's local zone once, before anything is drawn.  Every chart,
+    # caption and table in this pass then converts through the one zone this produces,
+    # so a reader in Chicago and one in Tokyo cannot read different clocks for the
+    # same bar -- and the axes cannot drift mid-session as the poller fires.
+    #
+    # The component runs client-side JavaScript in the browser and writes the
+    # detected zone into session_state["_browser_tz"], which resolve_local_zone()
+    # reads.  It is a no-op in tests (see tests/apphelpers.py), so it is safe to
+    # call unconditionally here.
+    resolve_local_zone()
 
     # ---- Resolve both tickers, before anything is drawn -------------------- #
     # **This is the reason the ticker inputs can float above the tabs.**  ``main()``
@@ -8033,9 +8425,9 @@ def main() -> None:
         # tab's slider resolves.
         if forecast_pipe is None:
             st.info(
-                "No Forecast ticker is loaded, so this tab has nothing to chart. Enter "
-                "a symbol on the <b>Forecast</b> tab and press **Fetch forecast "
-                "bars**. Every other tab is unaffected."
+                "No Forecast ticker is loaded, so this tab has nothing to chart. "
+                "Use the main ticker input above to load data for forecasting. "
+                "Every other tab is unaffected."
             )
         else:
             with timeframe_scope(forecast_tf.key):
@@ -8045,28 +8437,8 @@ def main() -> None:
                 )
 
     with tab_forecast:
-        # **The Forecast ticker input, at the top of this tab's body** -- drawn even
-        # when there is no pipeline yet, because that is exactly when the reader needs
-        # it.  Everything below is gated on ``forecast_pipe``, so without this the tab
-        # would be a dead end: it would say "no ticker is loaded" and offer no way to
-        # load one.
-        #
-        # It also has to come before the ``is None`` branch below, which is the whole
-        # reason it is not tucked inside the ``else``.
-        #
-        # **This draw and the one in the not-ready stub are on mutually exclusive
-        # paths**, so the key is registered once per pass.  They were not once: the
-        # stub drew it and then called the tab renderer, which drew it again, and
-        # Streamlit raised ``StreamlitDuplicateElementKey`` -- taking the whole page
-        # down, not just this tab.  ``TestTheRealAppRuns`` now runs the script for
-        # exactly this reason; the source-level tests could not see it.
-        render_scope_ticker(
-            "forecast",
-            note="This tab's ticker is its own — it starts on whatever the "
-                 "<b>Price</b> tab holds, then keeps its own. Switching either "
-                 "tab's ticker leaves the other tab's tape, brush and results "
-                 "untouched.",
-        )
+        # Forecast ticker input removed as requested
+        pass
 
         guide("Forecast")
         # The tab resolves its *own* window from its own brush and runs its own

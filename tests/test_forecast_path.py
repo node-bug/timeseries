@@ -30,6 +30,7 @@ import ast
 import re
 
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
 import pytest
 import streamlit as st  # noqa: F401  - needed to exec `forecast_path_for`'s decorator
@@ -38,6 +39,7 @@ from timeseries.forecast import ForecastPath, forecast_paths, forecast_paths_mul
 from timeseries.pipeline import Pipeline
 
 from apphelpers import app_block, app_source, load_app_functions
+from daily_bars import daily_bars
 from session_bars import session_bars
 
 #: Window length and projection both used by the app's chart.  Read out of ``app.py``
@@ -54,7 +56,7 @@ _ns = load_app_functions(
      # Read by ``build_forecast_path_figure`` to draw the closest-match trace.
      # ``load_app_functions`` only ``exec``s the names asked for, so a helper the
      # figure calls has to be listed here or it is a ``NameError`` at draw time.
-     "_closest_match_path", "_closest_distance_label"},
+     "_closest_match_path", "_closest_distance_label", "_proj_ticktext"},
     namespace={
         "go": go,
         "st": st,
@@ -484,6 +486,27 @@ def path(pipe):
     )
 
 
+@pytest.fixture(scope="module")
+def daily_pipe():
+    """A real pipeline over daily bars, at the app's own history length."""
+    return Pipeline.from_frame(daily_bars(252, seed=20260930), length=HISTORY)
+
+
+@pytest.fixture(scope="module")
+def daily_path(daily_pipe):
+    """A genuine path: the archive's last ``HISTORY`` bars matched against itself."""
+    start = daily_pipe.n_bars - HISTORY
+    query = daily_pipe.query_span(start, daily_pipe.n_bars, label="latest")
+    result = daily_pipe.match(query, k=MATCHES, amplitude_weight=1.0)
+    assert result.matches, "fixture must yield matches"
+    return forecast_paths(
+        daily_pipe.close,
+        np.array([m.start for m in result.matches], dtype=np.int64),
+        HISTORY, PROJECTION,
+        distances=np.array([m.distance for m in result.matches], dtype=float),
+    )
+
+
 def test_chart_draws_the_declared_history_and_projection(pipe, path):
     fig = build_forecast_path_figure(pipe, path)
     history = fig.data[0]
@@ -519,22 +542,56 @@ def test_the_two_halves_meet_at_zero(pipe, path):
     assert float(fig.data[-1].y[0]) == pytest.approx(0.0, abs=1e-9)
 
 
-def test_projected_ticks_are_offsets_and_never_timestamps(pipe, path):
-    """Bars that do not exist yet are not labelled with a time.
+def test_projected_ticks_are_clock_times_on_minute_data(pipe, path):
+    """Projected bars are labelled with the clock time they would occur at.
 
     Sessions are compressed, so a projection spanning an overnight close is drawn
-    contiguously -- which is fine for spacing and wrong for labels.  Every tick right
-    of the boundary is ``+K min``, so the chart never asserts a timestamp for a bar
-    it has no data for.
+    contiguously -- which is fine for spacing.  On 1-minute data the ticks right of
+    the boundary are clock times (``09:30``, ``09:35`` and so on), resolved from the
+    anchor bar's timestamp plus ``offset`` minutes, so the reader sees *when* the
+    projected bars would occur rather than just how many bars out they are.  One
+    1-minute bar is one minute of wall-clock time, so the offset in bars *is* the
+    offset in minutes; ``bars_per_session`` is how many bars fit in a session, not
+    how many minutes one bar spans, and must not enter here.
     """
     fig = build_forecast_path_figure(pipe, path)
+    tickvals = list(fig.layout.xaxis.tickvals)
+    labels = list(fig.layout.xaxis.ticktext)
+    # History ticks carry full timestamps; projection ticks are bare clock times.
+    # The last history tick is the last one whose label contains a date.
+    anchor = max(int(v) for v, t in zip(tickvals, labels) if "2026-" in str(t))
+    projected = [(int(v), t) for v, t in zip(tickvals, labels) if v > anchor]
+    assert projected, "projection must carry its own tick labels"
+    # Every projected tick is a clock time HH:MM.
+    assert all(re.fullmatch(r"\d{2}:\d{2}", str(t)) for _, t in projected)
+    anchor_ts = pd.Timestamp(pipe.bars["timestamp"].iloc[anchor])
+    # The +0 tick is the anchor's own time of day.
+    assert projected[0][1] == anchor_ts.strftime("%H:%M")
+    # **Every non-zero offset is one minute per bar from the anchor, not one session
+    # per bar.**  Checking only ``projected[0]`` -- the previous assertion -- let a
+    # multiplier of ``bars_per_session`` (390) ship: offset 0 lands on the anchor's
+    # own time whatever the multiplier is, and every tick after it was a full session
+    # out.  Each tick's value is its bar offset, so the label is the anchor's time of
+    # day plus that many minutes.
+    for v, t in projected:
+        # The projection's x-position for offset ``o`` is ``proj_anchor + 1 + o``,
+        # so ``o = v - anchor - 1`` (the max history tick *is* the anchor bar).
+        expected = (anchor_ts + pd.Timedelta(minutes=int(v) - anchor - 1)).strftime("%H:%M")
+        assert t == expected, (
+            "offset %d labelled %s, expected %s" % (v, t, expected)
+        )
+
+
+def test_projected_ticks_are_offsets_on_daily_data(daily_pipe, daily_path):
+    """On daily data the projection keeps offset labels, not clock times.
+
+    One bar per session, so an offset is a session count rather than a clock time.
+    """
+    fig = build_forecast_path_figure(daily_pipe, daily_path)
     labels = list(fig.layout.xaxis.ticktext)
     projected = [t for t in labels if str(t).startswith("+")]
     assert projected, "projection must carry its own tick labels"
-    assert all(str(t).endswith(" min") for t in projected)
-    # No tick on the projected side may look like a date.
-    assert not any(str(t).startswith("+") and "20" in str(t).split(" min")[0]
-                   for t in projected)
+    assert all(str(t).endswith(" day") or str(t).endswith(" days") for t in projected)
 
 
 def test_the_band_is_drawn_as_a_filled_pair(pipe, path):

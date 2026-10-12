@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+<title>Local timezone detector</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: transparent; }
+</style>
+</head>
+<body>
+<script src="/static/sclib/streamlit.js"></script>
+<script>
+(function () {
+  var tz;
+  try {
+    tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  } catch (e) {
+    tz = null;
+  }
+  if (!tz) {
+    tz = "UTC";
+  }
+  // Write to session_state so resolve_local_zone() can read it
+  Streamlit.setComponentValue(tz);
+  // The component value is returned to Python session_state
+  // Python's resolve_local_zone() reads st.session_state["_browser_tz"]
+})();
+</script>
+</body>
+</html>

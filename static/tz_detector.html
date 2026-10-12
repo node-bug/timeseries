@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+<title>Local timezone detector</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: transparent; }
+</style>
+</head>
+<body>
+<script src="/static/sclib/streamlit.js"></script>
+<script>
+(function () {
+  // Resolve the reader's own local IANA timezone and hand it back to Python.
+  // ``Intl.DateTimeFormat().resolvedOptions().timeZone`` is the only reliable
+  // browser-side source: it returns an IANA name (``America/New_York``) and
+  // handles DST automatically, which a fixed UTC offset cannot.
+  //
+  // This component carries no visible content of its own -- it is a zero-height
+  // bridge, called once at startup, and every chart in the app reads the value it
+  // produces.  Without it the axes would stay on UTC forever, because there is no
+  // other path for a browser fact to reach the Python that formats the ticks.
+  var tz;
+  try {
+    tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  } catch (e) {
+    tz = null;
+  }
+  if (!tz) {
+    // Detection failed (rare: some sandboxed browsers).  Fall back to UTC rather
+    // than to a string the app cannot resolve, so the axes stay honest about
+    // what they are showing.
+    tz = "UTC";
+  }
+  Streamlit.setComponentValue(tz);
+})();
+</script>
+</body>
+</html>

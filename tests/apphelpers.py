@@ -32,6 +32,7 @@ import functools
 import os
 import re
 import typing
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 APP = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py"
@@ -274,6 +275,27 @@ def load_app_functions(names, namespace=None) -> dict:
         # what a bar looks like, so an extracted body that formats a tick needs the
         # real helper here -- or it fails with a ``NameError`` at draw time.
         "store_stamp_label": _store_stamp_label,
+        # The display zone is a *computed* module constant (``ZoneInfo("UTC")`` and
+        # ``LOCAL_ZONE = [_UTC_ZONE]``), so ``_module_constants`` skips it -- and
+        # ``display_zone``/``stamp_zone``/``stamp_zone_name`` all read it.  Supplied
+        # here so the extracted bodies can resolve a zone; seeded with UTC, which is
+        # what the app falls back to before :func:`resolve_local_zone` runs, and what
+        # every test helper reads unless it overrides it.
+        "ZoneInfo": ZoneInfo,
+        "ZoneInfoNotFoundError": ZoneInfoNotFoundError,
+        "_UTC_ZONE": ZoneInfo("UTC"),
+        "LOCAL_ZONE": [ZoneInfo("UTC")],
+        # ``_TZ_COMPONENT`` is ``stc.declare_component(...)`` -- a call, not a
+        # literal -- so ``_module_constants`` skips it, and ``resolve_local_zone``
+        # invokes it.  Supplied as a no-op stand-in: the tests never actually ask the
+        # browser, they only exercise the conversion and the fallback paths.
+        "stc": _NoopComponent(),
+        "_TZ_COMPONENT": _NoopComponent(),
+        # ``_HERE`` is ``os.path.dirname(os.path.abspath(__file__))``, which
+        # ``_module_constants`` skips; ``_TZ_COMPONENT``'s declaration uses it to
+        # locate ``static/``.  Supplied so the module scope can be built at all.
+        "os": os,
+        "_HERE": os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     })
 
     # The resolution accessors are loaded **together with the body that reads them**,
@@ -298,8 +320,20 @@ def load_app_functions(names, namespace=None) -> dict:
                         "active_horizons", "active_label",
                         "active_unit", "bar_unit", "active_min_query_bars",
                         "active_max_query_bars", "active_view_sessions",
+                        # ``display_zone`` is the *display* zone accessor every
+                        # stamp helper converts through, and it is defined before
+                        # ``stamp_label`` in the source.  It has to be exec'd first
+                        # or the stamp helpers raise ``NameError`` when loaded in
+                        # isolation -- which is exactly what the first cut of this
+                        # change did, and is why it is listed here rather than
+                        # left to the caller's namespace.
+                        "display_zone",
                         "stamp_label", "stamp_span", "stamp_zone",
                         "stamp_zone_name", "stamp_column",
+                        # ``_proj_ticktext`` is the projection's own tick formatter;
+                        # ``build_forecast_path_figure`` calls it, so it has to be
+                        # loaded before the figure is.
+                        "_proj_ticktext",
                         "panel_root_for",
                         "timeframe_scope"]
     for name in dependency_order:
@@ -425,6 +459,21 @@ class _StubPipeline:
     def __init__(self, n_bars: int):
         self.n_bars = int(n_bars)
 
+class _NoopComponent:
+    """Stand-in for a ``streamlit.components.v1`` custom component.
+
+    ``app.py`` declares ``_TZ_COMPONENT`` at module scope and calls it from
+    :func:`resolve_local_zone` to ask the browser for its timezone.  The tests never
+    render a browser, and importing ``app.py``'s import block would drag in Streamlit
+    and run the UI -- so this object answers the call with ``"UTC"`` and nothing
+    else.  It is a *deliberate* UTC: every test that cares about the zone overrides
+    :data:`LOCAL_ZONE` through the ``resolution``/``_resolution`` context managers,
+    so a stand-in that silently returned a different zone would mask the very thing
+    those tests pin.
+    """
+
+    def __call__(self, *, key: str = "", default: str = "UTC"):
+        return default
 class WidgetKeyError(RuntimeError):
     """Stand-in for Streamlit's ``StreamlitValueAssignmentNotAllowedError``.
 

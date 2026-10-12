@@ -484,21 +484,30 @@ class FetchResult:
         sessions = self.sessions
         return float(self.n_bars) / sessions if sessions else float(self.n_bars)
 
-    def summary(self) -> str:
-        """One line describing what was fetched, for the UI to confirm with."""
+    def summary(self, *, zone: object = None) -> str:
+        """One line describing what was fetched, for the UI to confirm with.
+
+        ``zone`` is the *display* zone -- the reader's local zone, passed in by the
+        UI.  It defaults to ``None`` (the stamp's own zone, i.e. UTC), so a caller
+        that does not care about the reader's clock keeps the old behaviour and this
+        library stays free of any browser dependency.
+        """
         tf = self.tf
         if not self.ok:
             return "No bars returned for {} ({}).".format(self.symbol, tf.label.lower())
         # The stamps come from the package's one definition of what a bar looks like,
         # so this line and the app's chart axes cannot print the same bar two ways --
-        # and the "(UTC)" suffix is conditional for the same reason: a daily stamp is
-        # an Eastern date, not a UTC instant.
-        zone = "" if tf.bars_per_session == 1 else " (UTC)"
-        span = "{} → {}".format(stamp_label(self.first, tf.key),
-                                stamp_label(self.last, tf.key))
+        # and the zone suffix is conditional for the same reason: a daily stamp is an
+        # Eastern date, not a UTC instant, so naming any zone there would be a false
+        # claim.  On intraday the zone is whatever the reader's clock is.
+        zone_name = "" if tf.bars_per_session == 1 else (
+            " ({})".format(zone.key) if zone is not None else " (UTC)"
+        )
+        span = "{} → {}".format(stamp_label(self.first, tf.key, zone=zone),
+                                stamp_label(self.last, tf.key, zone=zone))
         return (
             "{} · {} · {:,} bars · {} sessions · {}{}".format(
-                self.symbol, tf.label, self.n_bars, self.sessions, span, zone,
+                self.symbol, tf.label, self.n_bars, self.sessions, span, zone_name,
             )
         )
 
