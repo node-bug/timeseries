@@ -61,7 +61,7 @@ body**, above the charts it changes:
 | Where | Feeds | Notes |
 |---|---|---|
 | **Price** tab's box | Price, Matches, Quality, Backtest | The app title, price chart and help text follow this one |
-| **Forecast** tab's box | Forecast and Projection | Starts on Price's ticker, then keeps its own; **Projection** charts the same ticker without a box of its own |
+| **Forecast** tab's box | Forecast, Projection and Progression | Starts on Price's ticker, then keeps its own; **Projection** and **Progression** chart the same ticker without a box of their own |
 
 Either box takes any symbol Yahoo accepts (`AAPL`, `MSFT`, `BRK-B`, …). Switching
 symbol clears the previous query for that tab only, so no stale match survives — and a
@@ -74,7 +74,7 @@ reference over the same archive and takes no reader input. The Forecast box seed
 on the Price ticker the first time, so nothing is downloaded twice on a fresh load;
 after that they are independent.
 
-### The two forecast tabs
+### The three forecast tabs
 
 *Projection* is the reference: the archive's most recent bars and where the closest
 matching windows went next, answered identically every time. It also carries the
@@ -85,6 +85,52 @@ read the evidence table beneath. The brush, the search settings and the table ar
 one tab because they describe one window: splitting them would mean brushing on one
 tab and reading the result on another. Both projections use the same *Projection bars*
 value, so the reference band and your own are directly comparable.
+
+### The Progression tab: one question, fifty lookbacks
+
+*Progression* asks the **same question about the same moment at fifty different
+lengths**, and draws all fifty answers on one chart.
+
+For every lookback length `L` — 10 bars, 20 bars, … up to 500 — the archive's own
+most recent `L` bars are matched against the archive's history, and the matched
+windows' forward paths are projected over 300 bars. All fifty projections are drawn
+simultaneously.
+
+**Why a sweep rather than a single forecast.** A single forecast answers "what
+usually followed this shape?". The sweep answers a question no single forecast can:
+*does the answer depend on how much history you look back?* When the 10-bar
+projection and the 500-bar projection disagree, the disagreement is informative — it
+says the recent tape is asserting something the longer history does not confirm.
+Reading one curve would hide that entirely.
+
+**Reading the chart.** Pale traces are short lookbacks, dark ones are long, so the
+colour ramp carries meaning rather than merely separating the lines. The bold red
+line is the median across all the lengths — what the lookbacks *agree* on — because
+fifty overlapping traces cannot be read by eye. Where the traces spread wide, the
+lookbacks disagree, and that spread is the finding.
+
+Everything is in **percent from the last close**, which is what lets fifty
+projections share one axis: each matched window is rebased to its own final close,
+so a trace describes the percentage move that followed rather than the price level
+it happened at.
+
+**The *Matches* column is the honest part.** A long lookback cannot always get
+thirty matches. Non-max suppression (§M) requires one full lookback of separation
+between accepted windows, so a 500-bar lookback can only place a handful of windows
+in an archive of this size — and a median over seven windows is a materially thinner
+claim than a median over thirty. The table beneath the chart reports the count for
+every length, and lengths that could not be projected at all are listed with the
+reason rather than silently dropped.
+
+The tab is a **reference**, not a query: every length asks about the archive's most
+recent bars, so the chart stays put while you explore other windows elsewhere. It
+forecasts the **Forecast** tab's instrument at the Forecast tab's resolution, and it
+draws no controls of its own — a duplicated widget key would raise
+`StreamlitDuplicateElementKey` and take down the whole page, because `st.tabs`
+renders every body on every pass.
+
+The maths lives in `src/timeseries/progression.py`; the tab is `render_progression_tab`
+in `app.py`.
 
 ### The resolution is chosen once, when the app opens
 
@@ -327,6 +373,13 @@ stored is skipped, so a second run in the same day downloads nothing. Run it aga
 after the close to fill out the still-trading session; that merges new bars rather
 than replacing them.
 
+**"Stored" is decided per ticker, not per archive.** A session is skipped only when
+*every* ticker in the universe already holds it. This matters because the archive
+also holds three instruments that trade 24/7 (`BTC-USD`, `HO=F`, `NG=F`): a weekend
+they hold is a weekend the whole equity cohort is then told it does not need. The
+old rule — "skip the day if *any* ticker holds it" — starved the 503-name cohort
+by nine trading sessions while the downloader reported it had nothing to do.
+
 **From the UI:** the sidebar has a **Sync archive now** button under *Archive
 status*, which runs exactly this command, streams its progress, and reports what it
 stored. It is the same script, not a second implementation, so the button and the
@@ -423,6 +476,75 @@ The **Sync archive now** sidebar button and the *build this archive* link both
 follow the resolution chosen at startup, so on daily they run `download_daily.py`
 against `data/sp500_daily/`. There is no separate daily UI: the Panel tab reads
 whichever archive the resolution selected.
+
+### Reading the *Archive status* sidebar block
+
+The block reports **two different archives**, and conflating them is the easiest way
+to misread it:
+
+| Number | Subject | Scope |
+|---|---|---|
+| `bars loaded` | the **in-memory** frame for the selected ticker | one ticker, after the ~20-bar feature warm-up is dropped |
+| `window` | the default query length | one ticker |
+| `Cohort through …` | the **on-disk** panel archive | all tickers in the archive |
+| `N of M tickers at the frontier` | the on-disk panel archive | all tickers in the archive |
+
+The two "bars" numbers are **not comparable**: the first is one ticker in memory, the
+second is the whole archive on disk.
+
+**"Cohort through *D*" is the date most tickers have reached** — the *mode* of the
+per-ticker newest sessions, not the newest session any ticker holds. The difference
+matters: the archive holds three 24/7 instruments, so the newest session *any* ticker
+holds is usually a weekend, always ahead of the equity cohort. Reporting that as
+"up to date" is what let the cohort sit nine sessions behind while the sidebar
+claimed everything was current.
+
+Alongside it the block reports:
+
+- **`N of M tickers at the frontier`** — how much of the cohort is actually current.
+  "One session behind" and "one ticker behind" are different problems.
+- **Behind: *k* (symbols)** — the specific tickers that have not caught up.
+- **Missing *n* sessions** — and, critically, whether they are **still inside
+  Yahoo's 30-day window** (a sync can recover them) or **older** (they are gone
+  permanently).
+- **Ahead of the cohort: *k*** — the 24/7 instruments, reported separately so they
+  cannot drag the frontier forward unnoticed.
+
+Age is counted in **trading sessions**, not calendar days, because the archive is
+measured in sessions: a Friday-to-Monday gap is three calendar days but one trading
+session, and a calendar count flagged a perfectly current Friday archive as stale
+every Monday morning.
+
+### Archive integrity
+
+A Parquet file whose bytes have been altered still has a **valid footer** — the
+footer records *where* the data pages are, not *what* they contain. A file that has
+lost a byte anywhere in its data region therefore parses cleanly and only fails when
+the pages are decoded.
+
+Every reader in this project catches that failure and moves on, which is right for a
+reader (one bad file must not stop the other 500 from being served) and wrong when
+it is *silent* — an archive that has lost 94% of its data and reports success is
+worse than one that fails loudly, because nothing prompts anyone to look.
+
+So the skip is still a skip, but it is now **reportable**:
+
+```python
+from timeseries.store import PanelStore
+from timeseries.sync import archive_integrity
+
+# Whole-archive check: which partitions cannot be read at all.
+report = archive_integrity("data/sp500_panel")
+# {'n_partitions': 13179, 'n_unreadable': 5, 'unreadable_tickers': ['NG=F'], 'ok': False}
+
+# Per-read reporting: the reader still skips, but says what it skipped.
+PanelStore("data/sp500_panel").load(
+    on_unreadable=lambda ticker, session, path: print("unreadable:", path))
+```
+
+`archive_integrity` is a separate call rather than part of `archive_status` because
+it reads every partition's data pages — 2.5s for the 13,179-file panel archive, on
+every Streamlit rerun. `archive_status` itself is 0.08s.
 
 The button is also a valid way to *build* the archive from empty. It widens the
 requested window automatically: when the archive holds no sessions it passes no
@@ -570,6 +692,8 @@ query's near-identical neighbours are excluded too.
   - `matrix_profile.py` — STUMPY primitives (profile, distance, discords)
   - `matching.py` — the funnel, exclusion and suppression over one STUMPY scorer
   - `forecast.py` — conditional forecast with baseline, permutation test, block bootstrap
+  - `progression.py` — the lookback sweep: one projection per lookback length, for the
+    Progression tab
   - `backtest.py` — walk-forward evaluation
   - `pipeline.py` — the single entry point; every forecast has a baseline
   - `fetch.py` — on-demand download for an arbitrary ticker, at either resolution
@@ -603,6 +727,37 @@ cross-sectional window must never span two tickers.
 2. Create a feature branch
 3. Make your changes
 4. Submit a pull request
+
+### Do not let Git rewrite the archives
+
+`.gitattributes` declares `*.parquet binary` (and the other binary payloads), and
+that rule is load-bearing rather than cosmetic.
+
+The catch-all `* text eol=lf` applies Git's *text* filter to every file it does not
+explicitly exclude, and the text filter's job is to rewrite line endings — it does
+that by deleting the CR byte of every CRLF pair on the way into the object store.
+For source code that is harmless. For a Parquet file it is destructive, because the
+file is a sequence of length-prefixed compressed pages with absolute byte offsets
+recorded in its footer: deleting one byte shifts every offset after it, and the
+footer no longer describes the file. Pyarrow then reports `Corrupt snappy compressed
+data`.
+
+This is not hypothetical — it happened here, and it happened *silently*, because a
+corrupt file still has a valid footer and so still parses:
+
+```text
+worktree   194,840 bytes, 2 CRLF pairs  -> reads fine, 4,418 rows
+committed  194,838 bytes, 0 CRLF pairs  -> "Corrupt snappy compressed data"
+```
+
+The two bytes are the whole difference. 480 tracked archives were committed in that
+state, and `git checkout` wrote the corrupted bytes back over the working tree, so
+the damage travelled with every clone.
+
+If you add a new binary file type, add it to `.gitattributes` in the same commit
+that introduces it. `tests/test_gitattributes.py` asserts the effective attributes
+rather than only the file's contents, so a rule that is stated but ineffective still
+fails the suite.
 
 ## License
 

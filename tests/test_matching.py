@@ -773,9 +773,6 @@ class TestSessionMaskEndToEnd:
         """Otherwise the lift partly measures the treatment's own censoring."""
         bars = session_bars(FIXTURE_BARS)
         pipe = Pipeline.from_frame(bars, length=60)
-        from timeseries.pipeline import session_boundary_mask
-
-        b = session_boundary_mask(pipe.bars["timestamp"])
         vm = pipe.forward_horizon_mask(60, 60)
         assert vm is not None and not vm.all()
         base = pipe.baseline_returns(400, (5, 60), seed=1, window_length=60,

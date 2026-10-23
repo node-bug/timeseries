@@ -787,7 +787,6 @@ class TestShapeFigureGeometry:
     def _figure_for(columns):
         """Call the app's own ``build_shape_figure`` against a synthetic pipe."""
         import numpy as np
-        from timeseries.features import FEATURE_COLUMNS
         from timeseries import matching as M
         from apphelpers import load_app_functions
 

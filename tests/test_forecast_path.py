@@ -53,6 +53,10 @@ _ns = load_app_functions(
     {"build_forecast_path_figure", "forecast_path_for", "fill_tokens",
      "resolve_selection_window", "session_spans",
      "resolve_query_window", "selection_to_span", "chart_config",
+     # The forecast chart's two sizes, read per resolution from the timeframe
+     # registry rather than as literals.  Listed here because
+     # ``load_app_functions`` only ``exec``s the names asked for.
+     "forecast_history_bars", "forecast_projection_bars",
      # Read by ``build_forecast_path_figure`` to draw the closest-match trace.
      # ``load_app_functions`` only ``exec``s the names asked for, so a helper the
      # figure calls has to be listed here or it is a ``NameError`` at draw time.
@@ -74,8 +78,13 @@ _ns = load_app_functions(
     },
 )
 build_forecast_path_figure = _ns["build_forecast_path_figure"]
-HISTORY = _ns["FORECAST_HISTORY_BARS"]
-PROJECTION = _ns["FORECAST_PROJECTION_BARS"]
+# The forecast chart's two sizes, read from the app's own accessors rather than
+# restated here.  They were module constants in ``app.py`` once, and were read here
+# as literals; they are now resolved per resolution from the timeframe registry
+# (240/240 on 1-minute, 60/20 on daily), so a literal would have pinned this file to
+# one resolution's calibration.
+HISTORY = _ns["forecast_history_bars"]()
+PROJECTION = _ns["forecast_projection_bars"]()
 MATCHES = _ns["FORECAST_PATH_MATCHES"]
 
 
@@ -517,17 +526,27 @@ def test_chart_draws_the_declared_history_and_projection(pipe, path):
     assert len(projection.x) == PROJECTION + 1
 
 
-def test_history_and_projection_are_adjacent_on_the_x_axis(pipe, path):
-    """No gap, and no overlap, between the two halves.
+def test_history_and_projection_share_the_anchor_bar(pipe, path):
+    """The two halves meet on **one** bar -- the anchor.
 
-    History ends on the archive's last bar ``n - 1``; the projection's offset 0 sits
-    on ``n``.  Any other arrangement either leaves a one-bar hole at the join or draws
-    the anchor twice.
+    ``forecast_paths`` is explicit about this: "Offset 0 is the anchor itself and is
+    exactly 0.0 ... it is the bar history and forecast share, so a chart drawn from
+    these offsets has the two halves meeting at one point rather than at two points
+    a bar apart."
+
+    The chart used to draw the projection one bar further right (``anchor + 1 +
+    offset``), so the projection's 0% point -- the anchor's own close -- landed on
+    the *next* bar's x-position.  That put the anchor's timestamp on the axis twice,
+    either side of the boundary, and made every projected label sit one bar behind
+    the bar it named.
     """
     fig = build_forecast_path_figure(pipe, path)
     last_history = int(max(fig.data[0].x))
     first_projection = int(min(fig.data[-1].x))
-    assert first_projection == last_history + 1
+    assert first_projection == last_history, (
+        "the projection's offset 0 is the anchor bar, which is the history's last "
+        "bar -- they must share it, not sit a bar apart"
+    )
 
 
 def test_the_two_halves_meet_at_zero(pipe, path):
@@ -565,18 +584,19 @@ def test_projected_ticks_are_clock_times_on_minute_data(pipe, path):
     # Every projected tick is a clock time HH:MM.
     assert all(re.fullmatch(r"\d{2}:\d{2}", str(t)) for _, t in projected)
     anchor_ts = pd.Timestamp(pipe.bars["timestamp"].iloc[anchor])
-    # The +0 tick is the anchor's own time of day.
-    assert projected[0][1] == anchor_ts.strftime("%H:%M")
-    # **Every non-zero offset is one minute per bar from the anchor, not one session
-    # per bar.**  Checking only ``projected[0]`` -- the previous assertion -- let a
+    # **Every offset is one minute per bar from the anchor, not one session per
+    # bar.**  Checking only the first tick -- the previous assertion -- let a
     # multiplier of ``bars_per_session`` (390) ship: offset 0 lands on the anchor's
     # own time whatever the multiplier is, and every tick after it was a full session
-    # out.  Each tick's value is its bar offset, so the label is the anchor's time of
-    # day plus that many minutes.
+    # out.  Each tick's value is its bar offset, so the label is the anchor's time
+    # of day plus that many minutes.
+    #
+    # **The offset is the number of bars from the anchor, so ``o = v - anchor``** --
+    # the projection's x-position for offset ``o`` is ``anchor + o``, because offset 0
+    # *is* the anchor bar.  It used to be ``anchor + 1 + o``, which put every label
+    # one bar behind the bar it named and printed the anchor's own time twice.
     for v, t in projected:
-        # The projection's x-position for offset ``o`` is ``proj_anchor + 1 + o``,
-        # so ``o = v - anchor - 1`` (the max history tick *is* the anchor bar).
-        expected = (anchor_ts + pd.Timedelta(minutes=int(v) - anchor - 1)).strftime("%H:%M")
+        expected = (anchor_ts + pd.Timedelta(minutes=int(v) - anchor)).strftime("%H:%M")
         assert t == expected, (
             "offset %d labelled %s, expected %s" % (v, t, expected)
         )
@@ -609,9 +629,15 @@ def test_the_band_is_drawn_as_a_filled_pair(pipe, path):
 
 
 def test_chart_covers_the_full_declared_span(pipe, path):
+    """The axis spans the history and the projection, which **share** the anchor.
+
+    The shared bar is counted once, so the span is one bar shorter than the two
+    widths added together -- the same arithmetic the shared bar implies on the
+    x-axis itself.
+    """
     fig = build_forecast_path_figure(pipe, path)
     lo, hi = fig.layout.xaxis.range
-    assert hi - lo == pytest.approx(HISTORY + PROJECTION)
+    assert hi - lo == pytest.approx(HISTORY + PROJECTION - 1)
 
 
 def test_short_archive_clamps_history_rather_than_failing(pipe, path):

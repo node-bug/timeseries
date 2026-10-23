@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 
 from .features import build_features, finalize_features, quality_report
-from .forecast import MIN_MATCHES, conditional_forecast, Forecast
+from .forecast import MIN_MATCHES, conditional_forecast
 from .store import OHLCV, session_et
 from .timeframes import DEFAULT_TIMEFRAME, get_timeframe, resolve_timeframe
 from . import matching as M

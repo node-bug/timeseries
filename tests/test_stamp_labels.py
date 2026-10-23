@@ -49,9 +49,9 @@ OPEN_EST = pd.Timestamp("2026-01-05 14:30:00", tz="UTC")  # 09:30 EST
 
 _NS = load_app_functions({
     "stamp_label", "stamp_span", "stamp_zone", "stamp_zone_name", "stamp_column",
-    "build_price_figure", "build_forecast_path_figure",
+    "build_price_figure", "build_forecast_path_figure", "build_progression_figure",
     "_closest_match_path", "_closest_distance_label",
-}, namespace={"go": go})
+}, namespace={"go": go, "px": __import__("plotly.express", fromlist=["px"])})
 
 # **One** ``load_app_functions`` call for the whole module, deliberately.  Each call
 # builds its own namespace, and the resolution helpers read a module-level
@@ -67,6 +67,8 @@ stamp_zone_name = _NS["stamp_zone_name"]
 stamp_column = _NS["stamp_column"]
 build_price_figure = _NS["build_price_figure"]
 build_forecast_path_figure = _NS["build_forecast_path_figure"]
+build_progression_figure = _NS["build_progression_figure"]
+stamp_labels = _NS["stamp_labels"]
 
 
 @contextmanager
@@ -291,6 +293,88 @@ class TestForecastPathAxis:
         assert all(":" not in t for t in projected), projected
         # The projected side is measured in days on daily, not minutes.
         assert all(t.endswith("day") or t.endswith("days") for t in projected), projected
+
+
+class TestHoverShowsStampNotIndex:
+    """The hover box prints a date/time (or an offset), never the bar index.
+
+    With ``hovermode="x unified"`` the box has a title and one entry per trace.
+    The title is blanked via ``unifiedhovertitle=dict(text="%{xother}")`` so it
+    cannot print the x value (the bar index).  Each trace's ``hovertemplate``
+    reads its stamp from ``customdata`` instead of ``%{x}``.
+    """
+
+    @pytest.fixture()
+    def daily_pipe(self):
+        return Pipeline.from_frame(daily_bars(400, seed=7), length=60, timeframe="1d")
+
+    @pytest.fixture()
+    def intraday_pipe(self):
+        return Pipeline.from_frame(session_bars(3000, seed=7), length=240)
+
+    def test_price_figure_hover_uses_customdata(self, daily_pipe, intraday_pipe):
+        for pipe, key in ((daily_pipe, "1d"), (intraday_pipe, "1m")):
+            with resolution(key):
+                fig = build_price_figure(pipe, pipe.n_bars - 200, pipe.n_bars)
+            trace = fig.data[0]
+            assert "%{customdata}" in trace.hovertemplate, trace.hovertemplate
+            assert "%{x}" not in trace.hovertemplate, trace.hovertemplate
+            assert fig.layout.xaxis.unifiedhovertitle.text == "%{xother}"
+            expected = stamp_labels(
+                pipe.bars["timestamp"].iloc[pipe.n_bars - 200:pipe.n_bars], key=key)
+            assert list(trace.customdata) == expected, (trace.customdata, expected)
+
+    def test_forecast_path_figure_hover_uses_customdata(self, daily_pipe):
+        from timeseries.forecast import forecast_paths
+
+        path = forecast_paths(daily_pipe.close, np.array([10, 40], dtype=np.int64),
+                              window_length=60, horizon=20)
+        assert path is not None, "fixture produced no forecast path"
+        with resolution("1d"):
+            fig = build_forecast_path_figure(daily_pipe, path)
+
+        assert fig.layout.xaxis.unifiedhovertitle.text == "%{xother}"
+        # History trace: real stamps.
+        hist = fig.data[0]
+        assert "%{customdata}" in hist.hovertemplate, hist.hovertemplate
+        assert "%{x}" not in hist.hovertemplate, hist.hovertemplate
+        hist_start = int(hist.x[0])
+        expected = stamp_labels(
+            daily_pipe.bars["timestamp"].iloc[hist_start:hist_start + len(hist.x)],
+            key="1d")
+        assert list(hist.customdata) == expected, (hist.customdata, expected)
+        # Projection traces: offset labels.
+        for trace in fig.data[1:]:
+            if trace.hovertemplate is None:
+                continue
+            assert "%{customdata}" in trace.hovertemplate, trace.hovertemplate
+            assert "%{x}" not in trace.hovertemplate, trace.hovertemplate
+
+    def test_progression_figure_hover_uses_customdata(self, intraday_pipe):
+        from timeseries.progression import default_lengths, progression_paths
+
+        lengths = default_lengths(intraday_pipe.n_bars, step=50)
+        sweep = progression_paths(
+            intraday_pipe, lengths=lengths, horizon=20, k=10)
+        with resolution("1m"):
+            fig = build_progression_figure(intraday_pipe, sweep, history_bars=500)
+
+        assert fig.layout.xaxis.unifiedhovertitle.text == "%{xother}"
+        # History trace: real stamps.
+        hist = fig.data[0]
+        assert "%{customdata}" in hist.hovertemplate, hist.hovertemplate
+        assert "%{x}" not in hist.hovertemplate, hist.hovertemplate
+        hist_start = int(hist.x[0])
+        expected = stamp_labels(
+            intraday_pipe.bars["timestamp"].iloc[hist_start:intraday_pipe.n_bars],
+            key="1m")
+        assert list(hist.customdata) == expected, (hist.customdata, expected)
+        # Projection traces: offset labels.
+        for trace in fig.data[1:]:
+            if trace.hovertemplate is None:
+                continue
+            assert "%{customdata}" in trace.hovertemplate, trace.hovertemplate
+            assert "%{x}" not in trace.hovertemplate, trace.hovertemplate
 
 
 class TestIntradayUnchanged:

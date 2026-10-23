@@ -1036,7 +1036,6 @@ class TestAppWiring:
         assertion is that the two cannot coexist -- a spacer here is only ever correct
         while some *other* thing about the layout happens to cancel it.
         """
-        src = app_source()
         body = app_text(r"def render_ticker_input\(.*?\n(?=\ndef )",
                         "render_ticker_input")
         assert "label_visibility=\"collapsed\"" in body, (

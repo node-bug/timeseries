@@ -591,10 +591,10 @@ def fetch_sp500_constituents(*, url: str = SP500_URL) -> pd.DataFrame:
 # The symbol registry
 # --------------------------------------------------------------------------- #
 #: Name of the symbol-registry sidecar, beside the archive root.  Defined once
-#: because three call sites spelled it out separately -- ``app.py``'s
-#: ``PANEL_SECTOR_NAME`` and a bare ``os.path.join`` in each downloader -- and a
-#: sidecar the reader cannot find under the name the code expects is invisible
-#: rather than broken: every consumer treats a missing file as "no labels".
+#: because three call sites spelled it out separately -- a name in ``app.py`` and
+#: a bare ``os.path.join`` in each downloader -- and a sidecar the reader cannot
+#: find under the name the code expects is invisible rather than broken: every
+#: consumer treats a missing file as "no labels".
 CONSTITUENTS_NAME = "constituents.csv"
 
 #: Sector recorded for a symbol no constituent list can describe.
@@ -853,7 +853,8 @@ def _iter_partition_files(root: str) -> Iterable[tuple[str, Optional[str], str]]
 
 
 def scan_partitions(root: str, *, tickers: Optional[Sequence[str]] = None,
-                    since: Optional[str] = None, until: Optional[str] = None) -> pd.DataFrame:
+                    since: Optional[str] = None, until: Optional[str] = None,
+                    on_unreadable=None) -> pd.DataFrame:
     """Read the archive back as one frame, from the filesystem, ignoring the manifest.
 
     ``root/<ticker=SYM>/date=YYYY-MM-DD>/bars.parquet``
@@ -862,6 +863,21 @@ def scan_partitions(root: str, *, tickers: Optional[Sequence[str]] = None,
     the authoritative record of what a partition holds, so a row's symbol and session
     come from its path.  That keeps the returned frame self-describing even if a
     partition's columns were written by an older version.
+
+    Unreadable partitions
+    ---------------------
+    A partition that cannot be read is **skipped**, and that is the only correct
+    behaviour for a reader: one bad file must not stop the other 500 from being
+    served.  But skipping it *silently* is how a 94%-corrupt archive came to
+    report itself as healthy, holding 191,181 rows instead of 4,164,637 with no
+    error anywhere -- and an archive that has lost 94% of its data and reports
+    success is worse than one that fails loudly, because nothing prompts anyone
+    to look.
+
+    So the skip stays, but it is now *reportable*: pass ``on_unreadable``, a
+    callable taking ``(ticker, session, path)``, and it is called for every
+    partition that could not be read.  The default is to stay quiet, so existing
+    callers are unaffected.
     """
     if not os.path.isdir(root):
         return pd.DataFrame(columns=["timestamp", "ticker", "session", *OHLCV])
@@ -879,6 +895,8 @@ def scan_partitions(root: str, *, tickers: Optional[Sequence[str]] = None,
         try:
             df = pd.read_parquet(path)
         except Exception:  # noqa: BLE001 - an unreadable partition is skipped, not fatal
+            if on_unreadable is not None:
+                on_unreadable(sym, day, path)
             continue
         if df.empty:
             continue
@@ -1366,6 +1384,44 @@ class PanelStore:
             out.update(str(v) for v in df["session"].dropna().unique())
         return sorted(out)
 
+    def session_map(self, *, tickers: Optional[Sequence[str]] = None) -> dict:
+        """``{ticker: [session, ...]}`` -- per-ticker coverage, ascending per ticker.
+
+        :meth:`sessions` answers "which days does this archive hold *somewhere*",
+        and that union is the wrong question for anything that has to reason about
+        the archive as a **cohort**.  A union is decided by its most advanced
+        member: one ticker that traded on a Sunday puts Sunday in the union, and
+        then every caller that compares that union against a trading calendar
+        concludes the archive is current when the other 500 tickers are nine
+        sessions behind.
+
+        This is not hypothetical here.  The archive holds three 24/7 instruments
+        (``BTC-USD``, ``HO=F``, ``NG=F``) that trade on days the equity cohort does
+        not, so the union's newest session is always a weekend, always ahead of the
+        cohort, and always makes the archive look current.  The per-ticker map is
+        what makes that visible: the cohort frontier is the *mode* of the per-ticker
+        newest sessions, not their maximum.
+
+        Costs one pass over the partition files, reading only the ``session``
+        column of a whole-ticker file, so it is cheap enough for a sidebar metric
+        on every Streamlit rerun.
+        """
+        want = {str(t).upper() for t in tickers} if tickers else None
+        out: dict[str, set[str]] = {}
+        for sym, day, path in _iter_partition_files(self.root):
+            if want is not None and sym not in want:
+                continue
+            bucket = out.setdefault(sym, set())
+            if day is not None:
+                bucket.add(day)
+                continue
+            try:
+                df = pd.read_parquet(path, columns=["session"])
+            except Exception:  # noqa: BLE001 - an unreadable file holds no known session
+                continue
+            bucket.update(str(v) for v in df["session"].dropna().unique())
+        return {sym: sorted(days) for sym, days in out.items() if days}
+
     def rebuild_manifest(self) -> dict:
         """Regenerate the manifest from the partitions actually on disk.
 
@@ -1796,12 +1852,20 @@ class PanelStore:
             self._write_manifest(rows)
 
     def load(self, *, tickers: Optional[Sequence[str]] = None,
-             since: Optional[str] = None, until: Optional[str] = None) -> pd.DataFrame:
-        """Read the archive back as one long frame (see :func:`scan_partitions`)."""
-        return scan_partitions(self.root, tickers=tickers, since=since, until=until)
+             since: Optional[str] = None, until: Optional[str] = None,
+             on_unreadable=None) -> pd.DataFrame:
+        """Read the archive back as one long frame (see :func:`scan_partitions`).
+
+        ``on_unreadable`` is passed through to :func:`scan_partitions`; see that
+        function for why a partition that cannot be read is skipped rather than
+        raised on, and why the skip is made reportable.
+        """
+        return scan_partitions(self.root, tickers=tickers, since=since, until=until,
+                               on_unreadable=on_unreadable)
 
     def per_ticker(self, *, tickers: Optional[Sequence[str]] = None,
-                   since: Optional[str] = None, until: Optional[str] = None) -> dict[str, pd.DataFrame]:
+                   since: Optional[str] = None, until: Optional[str] = None,
+                   on_unreadable=None) -> dict[str, pd.DataFrame]:
         """Bars split per ticker, each sorted by timestamp with a clean index.
 
         The index is reset per ticker so a bar index is meaningful only *within* a
@@ -1810,7 +1874,8 @@ class PanelStore:
         window span two companies -- which is the single easiest way to make a
         cross-sectional search meaningless.
         """
-        df = self.load(tickers=tickers, since=since, until=until)
+        df = self.load(tickers=tickers, since=since, until=until,
+                       on_unreadable=on_unreadable)
         if df.empty:
             return {}
         out: dict[str, pd.DataFrame] = {}

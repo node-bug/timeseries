@@ -100,6 +100,30 @@ def _trading_days(start: date, end: date) -> list[date]:
     return out
 
 
+def _all_tickers_hold(per_ticker: dict, symbols: Sequence[str], day: str) -> bool:
+    """True when **every** symbol in ``symbols`` already holds ``day``.
+
+    The per-ticker skip rule for an incremental run.  It is deliberately
+    per-ticker rather than per-archive because an archive is a **cohort** of
+    independent instruments, and the union of their sessions is not a property
+    any of them has.
+
+    A ticker that is not in the archive at all counts as **not** holding the day,
+    so a newly-added symbol forces the day to be fetched.  That is the correct
+    default: the cost of fetching a day that was already there is one wasted
+    request, and the cost of *not* fetching a day a new symbol needed is a
+    permanent hole in that symbol's history, because Yahoo only serves 30 days
+    of minute bars.
+    """
+    wanted = {str(s).upper() for s in symbols}
+    if not wanted:
+        return False
+    for sym in wanted:
+        if day not in per_ticker.get(sym, ()):
+            return False
+    return True
+
+
 def _download_batch(symbols: Sequence[str], start: date, end: date, *, log=print) -> dict[str, pd.DataFrame]:
     """Fetch 1-minute bars for a batch of symbols, returning ``{symbol: frame}``.
 
@@ -324,11 +348,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # ---- incremental: skip days every ticker already has ------------------ #
     wanted = _trading_days(start, end)
     if args.incremental:
-        held = set(store.sessions())
         if args.tickers:
             todo_days = wanted
         else:
-            todo_days = [d for d in wanted if d.isoformat() not in held]
+            # **Per-ticker**, not per-archive.
+            #
+            # The old code asked "does the archive hold this day?" -- a *union*
+            # over every ticker -- and skipped the day if *any* ticker held it.
+            # That is the wrong question for a cohort, and it was wrong in a way
+            # that silently starved the archive:
+            #
+            #   the archive holds three instruments that trade 24/7 (BTC-USD, HO=F,
+            #   NG=F), so they hold *weekends*.  A weekend they hold is a weekend
+            #   the entire equity cohort is then told it does not need.
+            #
+            # The symptom was measurable: the 503-name S&P 500 cohort was stuck
+            # nine weekdays behind, and the sidebar's own "Sync archive now"
+            # button computed an empty work list and reported success.
+            #
+            # The correct rule: a day is skippable only when **every** ticker in
+            # the universe already holds it.  Anything less, and the day is
+            # fetched -- which is exactly the intent of "--incremental".
+            per_ticker = store.session_map()
+            todo_days = [
+                d for d in wanted
+                if not _all_tickers_hold(per_ticker, symbols, d.isoformat())
+            ]
         if not todo_days:
             log(f"Nothing to do: every session in {start}..{end} is already stored.")
             return 0

@@ -3,6 +3,62 @@
 # Set line endings to LF for all files
 * text eol=lf
 
+# --------------------------------------------------------------------------- #
+# BINARY ARCHIVES -- never subject these to the text filter above.
+# --------------------------------------------------------------------------- #
+# Why this rule exists
+# --------------------
+# The catch-all `* text eol=lf` above applies Git's *text* filter to every file
+# it does not explicitly exclude, and the text filter's job is to rewrite line
+# endings.  It does that by deleting the CR byte of every CRLF pair on the way
+# into the object store.
+#
+# That is harmless for source code and catastrophic for a Parquet file, because
+# a Parquet file is a sequence of length-prefixed compressed pages with absolute
+# byte offsets recorded in its footer.  Deleting a byte shifts every offset
+# after it, and the footer no longer describes the file -- pyarrow then reports
+# "Corrupt snappy compressed data" or "Couldn't deserialize thrift".
+#
+# This is not hypothetical.  It happened here: with no `*.parquet` rule, 488 of
+# the 13,637 tracked archives were committed with their CRLF pairs collapsed,
+# and a `git checkout` writes those corrupted bytes back over the working tree.
+# Measured on a single file:
+#
+#     worktree   194,840 bytes, 2 CRLF pairs  -> reads fine, 4,418 rows
+#     committed  194,838 bytes, 0 CRLF pairs  -> "Corrupt snappy compressed data"
+#
+# The two bytes are the whole difference.  `*.parquet binary` is therefore not a
+# tidy-up; it is the fix.
+#
+# `binary` is used rather than `-text` because `binary` is a macro that expands
+# to `-diff -merge -text`, which is what a file that must never be touched by a
+# content filter wants.
+*.parquet binary
+
+# Other binary payloads the archive and the tools write.  Same reasoning.
+*.feather binary
+*.arrow binary
+*.arrow5 binary
+*.orc binary
+*.avro binary
+*.pb binary
+*.h5 binary
+*.hdf5 binary
+*.npy binary
+*.npz binary
+*.pkl binary
+*.pickle binary
+*.joblib binary
+*.db binary
+*.sqlite binary
+*.sqlite3 binary
+
+# CSV stays text.  This line is a no-op relative to the catch-all above -- it is
+# spelled out because the archive's CSVs are read with `engine="pyarrow"` for
+# speed and are compared byte-for-byte by the store, so it is worth being
+# explicit that they are *not* binary and never were intended to be.
+*.csv text eol=lf
+
 # Set binary files as binary
 *.png binary
 *.jpg binary

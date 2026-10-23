@@ -329,7 +329,11 @@ class TestPooledPathFigure:
 
         fig = builder(pipe, bundle["path"])
         lo, hi = fig.layout.xaxis.range
-        assert hi - lo == pytest.approx(480)
+        # **The history and the projection share the anchor bar**, so the axis
+        # is one bar shorter than the two widths added together.  ``forecast_paths``
+        # is explicit that "offset 0 is the anchor itself ... the bar history and
+        # forecast share".
+        assert hi - lo == pytest.approx(240 + 240 - 1)
         assert bundle["path"].median[0] == 0.0, (
             "the pooled median must start at the anchor, like the single-ticker one"
         )

@@ -12,11 +12,13 @@ noise is worse than no matcher at all, because it looks more convincing.
 
 from __future__ import annotations
 
+import ctypes
 import threading
 
 import numpy as np
 import pytest
 
+from timeseries import _threading
 from timeseries import matching as M
 from timeseries import matrix_profile as MP
 
@@ -460,3 +462,113 @@ def test_numba_guard_is_reentrant():
     with MP.numba_guard():
         with MP.numba_guard():
             pass
+
+
+# --------------------------------------------------------------------------- #
+# Threading layer: the abort is fixed at the layer, not only by the guard
+# --------------------------------------------------------------------------- #
+def test_vendored_libomp_is_present_and_loadable():
+    """The vendored OpenMP runtime must exist and be loadable into the process.
+
+    Numba's ``omppool`` extension links against ``@rpath/libomp.dylib``, so this file
+    has to be a real Mach-O dylib whose install name matches -- otherwise the preload
+    silently does nothing and Numba falls back to the unsafe ``workqueue`` layer.
+    """
+    lib = _threading.VENDORED_LIBOMP
+    assert lib.is_file(), f"vendored OpenMP runtime is missing: {lib}"
+    assert lib.name == "libomp.dylib"
+
+    ctypes.CDLL(str(lib), mode=ctypes.RTLD_GLOBAL)
+
+
+def test_threading_layer_is_not_the_unsafe_workqueue():
+    """After the first parallel launch, Numba must be on a threadsafe layer.
+
+    ``workqueue`` is the layer that aborts the process under concurrent access, so
+    being on it means the fix silently regressed and the only remaining protection is
+    the serialising guard.
+    """
+    MP.warm_up()  # forces Numba to resolve its layer
+    status = MP.threading_layer_status()
+
+    assert status["layer"] is not None, "Numba did not report a threading layer"
+    assert status["layer"] != "workqueue", (
+        "Numba is on the non-threadsafe 'workqueue' layer; the vendored OpenMP "
+        "runtime did not load and concurrent scoring can abort the process"
+    )
+
+
+def test_concurrent_scoring_without_the_guard_does_not_abort():
+    """The real regression: concurrency must be safe even with no serialisation.
+
+    The guard alone hides the underlying problem -- it serialises access so the
+    ``workqueue`` layer never sees overlap.  This test calls STUMPY directly, with
+    no guard at all, and asserts the process survives.  Under ``workqueue`` this
+    aborts the entire pytest process with SIGABRT (exit 134, no traceback), which is
+    the crash this whole mechanism exists to prevent.
+    """
+    import stumpy
+
+    MP.warm_up()
+    assert MP.threading_layer_status()["layer"] != "workqueue", (
+        "cannot test layer-level safety while Numba is on 'workqueue'"
+    )
+
+    errors: list[BaseException] = []
+
+    def work(seed: int) -> None:
+        try:
+            rng = np.random.default_rng(seed)
+            for _ in range(10):
+                stumpy.mass(rng.normal(size=32), rng.normal(size=600))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=work, args=(i,)) for i in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=120)
+
+    assert not errors, f"unguarded concurrent STUMPY raised: {errors[0]!r}"
+
+
+def test_nested_parallel_region_does_not_abort():
+    """Numba's ``workqueue`` layer also aborts on a *nested* parallel launch.
+
+    This is the second trigger of the same crash, and it is not something a lock can
+    prevent -- the guard serialises threads, but a nested region happens within one
+    thread.  Only a threadsafe layer survives it.
+    """
+    from numba import njit, prange
+
+    MP.warm_up()
+    assert MP.threading_layer_status()["layer"] != "workqueue", (
+        "cannot test nested-parallel safety while Numba is on 'workqueue'"
+    )
+
+    @njit(parallel=True)
+    def inner(x):
+        total = 0.0
+        for i in prange(len(x)):
+            total += x[i]
+        return total
+
+    @njit(parallel=True)
+    def outer(x):
+        total = 0.0
+        for i in prange(len(x)):
+            total += inner(x)
+        return total
+
+    result = outer(np.arange(100.0))
+
+    assert result == pytest.approx(495000.0)
+
+
+def test_threading_layer_status_shape():
+    """The diagnostic used by the app's startup log must keep its shape."""
+    status = MP.threading_layer_status()
+
+    assert set(status) == {"layer", "vendored_libomp", "libomp_loadable"}
+    assert isinstance(status["libomp_loadable"], bool)

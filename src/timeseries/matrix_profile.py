@@ -39,6 +39,13 @@ from typing import Iterator, Optional
 
 import numpy as np
 
+# Imported for its side effect: it preloads the threadsafe OpenMP runtime so Numba
+# selects the ``omp`` layer rather than the unsafe ``workqueue`` default.  The
+# package ``__init__`` already does this, but importing it here as well makes the
+# dependency explicit for anyone reading this module -- and matters if this module is
+# ever loaded on its own.  See :mod:`timeseries._threading`.
+from . import _threading
+
 __all__ = [
     "STUMPY_AVAILABLE",
     "CANONICAL_LENGTHS",
@@ -50,6 +57,7 @@ __all__ = [
     "top_matches",
     "discord_report",
     "numba_guard",
+    "threading_layer_status",
 ]
 
 try:
@@ -79,9 +87,20 @@ STUMPY_AVAILABLE = True
 #
 # Streamlit runs each session on its own script thread, so two browser tabs, or a tab
 # plus a ``st.cache_resource``/background warm-up, is enough to hit it.  Setting
-# ``NUMBA_NUM_THREADS=1`` does *not* help (the parallel region still launches); the
-# threadsafe ``tbb`` layer is not installed in this venv.  Serialising the entry
-# points is the fix that works with what is actually installed.
+# ``NUMBA_NUM_THREADS=1`` does *not* help (the parallel region still launches).
+#
+# Two independent defences, in order of preference:
+#
+# 1.  A genuinely threadsafe threading layer.  Importing :mod:`timeseries._threading`
+#     (done above, before STUMPY is used) preloads a vendored OpenMP runtime, which
+#     makes Numba select the ``omp`` layer instead of ``workqueue``.  OpenMP permits
+#     concurrent parallel regions and nested launches, so the abort cannot happen at
+#     all.  This is the real fix: it restores parallelism rather than removing it.
+#
+# 2.  :func:`numba_guard` below, which serialises access to the kernels.  This is
+#     defence-in-depth for platforms where no threadsafe layer can be loaded, and it
+#     costs only the wall-clock overlap between concurrent queries -- the kernels
+#     themselves still use all cores -- so the single-user case is unaffected.
 #
 # The guard is module-level and re-entrant on purpose: :func:`warm_up` and the
 # multi-channel loop in :func:`distance_profile` both call back into it, and RLock
@@ -99,6 +118,16 @@ def numba_guard() -> Iterator[None]:
     """
     with _NUMBA_LOCK:
         yield
+
+
+def threading_layer_status() -> dict:
+    """Report the Numba threading layer in use, for diagnostics and tests.
+
+    ``layer`` is ``None`` before Numba's first parallel launch, since it resolves the
+    layer lazily.  Use this to confirm the app is not running on the unsafe
+    ``workqueue`` layer; see :func:`timeseries._threading.threading_layer_status`.
+    """
+    return _threading.threading_layer_status()
 
 
 # §T option 1: a small canonical grid, so a handful of cached profiles covers the UX.

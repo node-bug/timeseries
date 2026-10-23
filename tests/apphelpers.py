@@ -250,6 +250,11 @@ def load_app_functions(names, namespace=None) -> dict:
         timeframe_keys,
     )
     from timeseries.store import stamp_label as _store_stamp_label  # noqa: PLC0415
+    # ``session_et`` is the package's one definition of a session's *date*, and
+    # ``app.py``'s vectorised ``stamp_labels`` calls it for daily bars.  Supplied
+    # here for the same reason ``stamp_label`` is: the extracted body needs the
+    # real helper, not a stand-in that could format a date differently.
+    from timeseries.store import session_et as _session_et  # noqa: PLC0415
 
     # The two archive roots are ``os.path.join(...)`` expressions, so
     # ``_module_constants`` skips them -- deliberately, since evaluating an
@@ -275,6 +280,7 @@ def load_app_functions(names, namespace=None) -> dict:
         # what a bar looks like, so an extracted body that formats a tick needs the
         # real helper here -- or it fails with a ``NameError`` at draw time.
         "store_stamp_label": _store_stamp_label,
+        "session_et": _session_et,
         # The display zone is a *computed* module constant (``ZoneInfo("UTC")`` and
         # ``LOCAL_ZONE = [_UTC_ZONE]``), so ``_module_constants`` skips it -- and
         # ``display_zone``/``stamp_zone``/``stamp_zone_name`` all read it.  Supplied
@@ -330,10 +336,28 @@ def load_app_functions(names, namespace=None) -> dict:
                         "display_zone",
                         "stamp_label", "stamp_span", "stamp_zone",
                         "stamp_zone_name", "stamp_column",
+                        # ``stamp_labels`` is the vectorised twin of ``stamp_label``:
+                        # the charts carry the stamps on ``customdata`` so the hover
+                        # can print a date and time instead of a bar number, and that
+                        # needs the whole run of them at once.
+                        "stamp_labels",
                         # ``_proj_ticktext`` is the projection's own tick formatter;
                         # ``build_forecast_path_figure`` calls it, so it has to be
                         # loaded before the figure is.
                         "_proj_ticktext",
+                        # The closest-match helpers.  ``build_forecast_path_figure``
+                        # resolves the orange trace through
+                        # ``_frozen_or_rebuilt_match``, which calls
+                        # ``_frozen_match_is_usable`` and falls back to
+                        # ``_closest_match_path``; and ``_freeze_closest_match``
+                        # calls ``_closest_match_path`` to capture the series the
+                        # *Live* tab freezes.  All three have to be in the namespace
+                        # before the figure is drawn, or the trace raises a
+                        # ``NameError`` at draw time.
+                        "_closest_match_path",
+                        "_frozen_match_is_usable",
+                        "_frozen_or_rebuilt_match",
+                        "_freeze_closest_match",
                         "panel_root_for",
                         "timeframe_scope"]
     for name in dependency_order:
@@ -427,6 +451,7 @@ def _pandas():
 
 def load_geometry():
     """The three Price-tab view helpers, straight out of ``app.py``.
+
 
     ``span_context_bounds``, ``shared_anchor`` and ``aligned_view`` decide where the
     query band and the match band are drawn, so "are they aligned?" is a question
@@ -527,3 +552,40 @@ class WidgetAwareSessionState(dict):
                 "value the app writes.".format(key)
             )
         dict.__setitem__(self, key, value)
+
+
+# --------------------------------------------------------------------------- #
+# Shared fixtures for the Live and Projection tab tests
+# --------------------------------------------------------------------------- #
+# Both files need the same three things: a long tape to cut windows from, a
+# pipeline over a slice of it, and an empty session state per test.  Each had its
+# own copy, and the copies had already drifted -- the Projection tab's ``_window``
+# had lost the second half of the explanation the Live tab's kept.  One definition
+# here means the two files cannot disagree about what a refetch looks like.
+
+#: One long tape, from which the rolling archive windows are cut.
+#:
+#: ``session_bars`` rounds its bar count up to a whole number of sessions, so
+#: asking it for "800 bars" and "900 bars" produces the *same* archive -- which
+#: would make every "the archive grew" assertion vacuous.  One long frame with
+#: explicit windows cut out of it is what makes the growth real.
+def live_tape():
+    """The shared 4290-bar 1-minute tape both tab tests cut windows from."""
+    from session_bars import session_bars
+
+    return session_bars(4290, seed=11)
+
+
+def window_over_tape(tape, start: int, stop: int):
+    """A pipeline over ``tape``'s bars ``[start, stop)``.
+
+    **This is what a refetch looks like.**  The archive is a rolling window over
+    the tape: as time passes, bars are appended at the end and age out at the
+    front, so the *same* moment moves to a different bar index.  A window that
+    only grew at the end would not exercise that, which is the half of the
+    problem a timestamp pin is really there to solve.
+    """
+    from timeseries.pipeline import Pipeline
+
+    frame = tape.iloc[start:stop].reset_index(drop=True)
+    return Pipeline.from_frame(frame, length=60, timeframe="1m")

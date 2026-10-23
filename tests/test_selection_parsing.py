@@ -35,7 +35,6 @@ import pandas as pd
 import pytest
 
 from apphelpers import (
-    app_block,
     app_called_names,
     app_defined_names,
     app_source,

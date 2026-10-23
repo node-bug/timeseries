@@ -30,7 +30,6 @@ numbers are asserted against the same fixtures as before.
 
 from __future__ import annotations
 
-import sys
 from datetime import date, time
 
 import numpy as np
@@ -767,6 +766,12 @@ class TestAppResolutionIdentity:
 
         source = open(APP, encoding="utf-8").read()
         tree = ast.parse(source)
+        # These were module-level constants in ``app.py`` once.  ``MAX_QUERY_BARS``,
+        # ``FORECAST_HISTORY_BARS`` and ``FORECAST_PROJECTION_BARS`` have since been
+        # removed -- the first was the 1-minute literal of a value the registry owns,
+        # and the other two were replaced by resolution-aware accessors of the same
+        # name -- so they are listed here only to catch a *call site* reading one
+        # directly, which is the failure this test exists for.
         stale = {"MAX_QUERY_BARS", "DEFAULT_HORIZONS", "FORECAST_HISTORY_BARS",
                  "FORECAST_PROJECTION_BARS"}
 
@@ -825,7 +830,7 @@ class TestResolutionGateBehaviour:
         an archive the reader did not ask for -- 6,285 daily bars rather than ~7,800
         minute bars, a visible and wasteful thing to do on their behalf.
         """
-        from apphelpers import expected_tab_count, run_app_unanswered
+        from apphelpers import run_app_unanswered
 
         at = run_app_unanswered()
         assert not at.exception, [e.value for e in at.exception]

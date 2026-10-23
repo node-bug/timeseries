@@ -347,10 +347,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _register(args.root, symbols, table=table)
 
     if args.incremental and held and args.tickers is None:
-        # Only sessions the archive has never seen.  The newest session is
-        # deliberately re-fetched: it was written while still trading, so it
-        # is the one partition most likely to have gained bars since.
-        todo = sorted(set(_weekdays(start, end)) - held)
+        # Only sessions **no ticker** has -- but computed per-ticker, not from the
+        # union of the archive's sessions.
+        #
+        # The old code subtracted the union of every ticker's sessions.  The
+        # archive holds three instruments that trade 24/7 (BTC-USD, HO=F, NG=F),
+        # so a weekend they hold is a weekend the entire equity cohort is then
+        # told it already has.  The symptom: the 503-name S&P cohort sat nine
+        # weekdays behind while the downloader reported it had nothing to do.
+        #
+        # A day is skippable only when **every** symbol already holds it.
+        per_ticker = store.session_map()
+        todo = sorted(
+            d for d in set(_weekdays(start, end))
+            if not _all_tickers_hold(per_ticker, symbols, d)
+        )
         # ...but a re-fetch of a held day is what finds revisions, so for a
         # full universe we still walk the newest few days.
         recent = [d for d in _weekdays(end - timedelta(days=args.days or 5), end)]
@@ -476,6 +487,29 @@ def _weekdays(start: date, end: date) -> list[date]:
             out.append(cur)
         cur += timedelta(days=1)
     return out
+
+
+def _all_tickers_hold(per_ticker: dict, symbols: Sequence[str], day: str) -> bool:
+    """True when **every** symbol in ``symbols`` already holds ``day``.
+
+    The per-ticker skip rule for an incremental run.  An archive is a **cohort**
+    of independent instruments, and the union of their sessions is not a property
+    any of them has: three of the archived instruments trade 24/7, so a weekend
+    they hold would otherwise mark the whole weekend as done for everyone.
+
+    A symbol absent from the archive counts as **not** holding the day, so a
+    newly-added symbol forces the day to be fetched.  That is the right default:
+    the cost of re-fetching a day already held is one wasted request, and the
+    cost of skipping a day a new symbol needed is a permanent hole in that
+    symbol's history.
+    """
+    wanted = {str(s).upper() for s in symbols}
+    if not wanted:
+        return False
+    for sym in wanted:
+        if day not in per_ticker.get(sym, ()):
+            return False
+    return True
 
 
 def _slice(frame: pd.DataFrame, first: date, last: date) -> Optional[pd.DataFrame]:

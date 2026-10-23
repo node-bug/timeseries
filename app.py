@@ -46,6 +46,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import plotly.graph_objects as go  # noqa: E402
+import plotly.express as px  # noqa: E402
 import streamlit as st  # noqa: E402
 import streamlit.components.v1 as stc  # noqa: E402
 from plotly.subplots import make_subplots  # noqa: E402
@@ -72,14 +73,20 @@ from timeseries.forecast import forecast_paths, forecast_paths_multi  # noqa: E4
 from timeseries import panel as PNL  # noqa: E402
 from timeseries.panel import PanelSearch  # noqa: E402
 from timeseries.pipeline import (  # noqa: E402
-    DEFAULT_HORIZONS, DEFAULT_K, Pipeline, horizons_for, pipeline_from_frame,
+    DEFAULT_K, Pipeline, horizons_for,
+)
+from timeseries.progression import (  # noqa: E402
+    MAX_PROGRESSION_LENGTH,
+    ProgressionSweep,
+    default_lengths,
+    progression_paths,
 )
 from timeseries.store import (  # noqa: E402
     CONSTITUENTS_NAME,
     MERGE_POLICY,
     PanelStore,
-    constituents_path,
     read_sectors,
+    session_et,
     stamp_label as store_stamp_label,
 )
 from timeseries import sync as SYNC  # noqa: E402
@@ -96,7 +103,29 @@ st.set_page_config(layout="wide", page_title="Pattern Matcher")
 # first match -- which would otherwise look like a multi-second freeze mid-interaction.
 MP.warm_up()
 
+# Report the Numba threading layer now that the JIT has run and the layer is resolved.
+# The default layer on macOS is "workqueue", which aborts the whole process (SIGABRT,
+# no traceback) if two threads score at once -- so a "workqueue" line here is the early
+# warning that concurrency is only being protected by the serialising guard.  On
+# macOS the expected value is "omp"; anything else is worth knowing about.
+_THREADING_LAYER = MP.threading_layer_status().get("layer")
+if _THREADING_LAYER and _THREADING_LAYER != "omp":
+    print(f"[numba] threading layer: {_THREADING_LAYER} (not threadsafe)")
+
 ROLLING_WINDOW = 20           # rolling mean / 2-sigma band on the price chart
+
+# =============================================================================== #
+# Recently used tickers
+# =============================================================================== #
+# Default recently used tickers shown as buttons in the sidebar.  A ticker that is
+# fetched (typed or clicked) moves to the front of the list; when the list exceeds
+# :data:`MAX_RECENT_TICKERS` the tail entry is dropped.
+DEFAULT_RECENT_TICKERS: List[str] = [
+    "^VIX", "BTC-USD", "QQQ", "SOXL", "NG=F", "HO=F", "CL=F",
+    "XBI", "LABU", "AAPL", "MSFT", "TSLA",
+]
+MAX_RECENT_TICKERS = 12
+RECENT_TICKERS_KEY = "recent_tickers"
 
 # =============================================================================== #
 # Active timeframe
@@ -154,10 +183,10 @@ SESSION_TIMEFRAME_GO_LABEL = "Continue"
 # therefore correct on whichever pass asks.
 #
 # Keeping the module-level *names* rather than threading a parameter through every
-# function is deliberate.  Dozens of call sites read ``DEFAULT_LENGTH`` or
-# ``MAX_QUERY_BARS``, and passing a timeframe into each would put the resolution
-# decision in fifty places instead of one.  ``MAX_QUERY_BARS`` in particular is
-# referenced by tests and by the sidebar slider, and a rename would have churned all
+# function is deliberate.  Dozens of call sites read ``DEFAULT_LENGTH`` or the
+# query-length bounds, and passing a timeframe into each would put the resolution
+# decision in fifty places instead of one.  The bounds in particular are
+# referenced by the sidebar slider, and a rename would have churned all
 # of them for no behavioural gain.
 def _tf(key: object = None) -> Any:
     """The active timeframe, or an explicit one when ``key`` is given."""
@@ -232,10 +261,9 @@ def display_zone(key: object = None) -> ZoneInfo:
 _UTC_ZONE: ZoneInfo = ZoneInfo("UTC")
 
 # The reader's local zone, as a one-element list for the same reason
-# :data:`ACTIVE_TIMEFRAME` is one: Streamlit re-runs this script top to bottom on
-# every interaction, so a plain module global would be re-initialised and any value
-# written earlier in the pass would have no reader.  It is populated by
-# :func:`resolve_local_zone` before anything reads it.
+# :data:`ACTIVE_TIMEFRAME` is one: a plain module global would be re-initialised on
+# every rerun and any value written earlier in the pass would have no reader.  It is
+# populated by :func:`resolve_local_zone` before anything reads it.
 LOCAL_ZONE: List[Any] = [_UTC_ZONE]
 
 
@@ -256,6 +284,64 @@ def stamp_label(ts: object, *, key: object = None) -> str:
     drops it -- only the *zone suffix* (below) moves with the reader.
     """
     return store_stamp_label(ts, _tf(key), zone=display_zone(key))
+
+
+def stamp_labels(timestamps: Any, *, key: object = None) -> List[str]:
+    """A whole run of bars' stamps, in the reader's own format.
+
+    **The vectorised twin of :func:`stamp_label`, and it must agree with it bar for
+    bar.**  A chart that labels its *axis* with :func:`stamp_label` and its *hover*
+    with a different formatter is a chart that says two different things about the
+    same bar, and a reader comparing an axis label against a hover label is exactly
+    how that gets noticed.  So this does not define a second format: it computes the
+    same one, faster.
+
+    The loop over :func:`stamp_label` is the reference behaviour and costs about a
+    quarter of a second for a two-thousand-bar daily archive -- noticeable on every
+    redraw of a chart that draws several of these, and the reason the fast path
+    exists.  It is not, however, the *only* path: :func:`stamp_label` has a
+    ``"—"`` branch for a missing stamp and a per-bar zone conversion, and a
+    vectorised rewrite that quietly changed either would be a divergence.  The
+    fast path therefore reproduces the format exactly and falls back to the loop
+    for anything it cannot prove it can reproduce -- an empty run, a non-``tz``
+    timestamp, a bar whose stamp is missing.
+
+    ``timestamps`` is any indexable sequence of timestamps; the result is one label
+    per element, in the same order.
+    """
+    values = list(timestamps)
+    if not values:
+        return []
+
+    tf = _tf(key)
+    zone = display_zone(key)
+    try:
+        series = pd.to_datetime(pd.Series(values), utc=True, errors="coerce")
+    except (TypeError, ValueError):
+        # A dtype pandas cannot read is not an error here -- the loop below handles
+        # whatever it is, one bar at a time.
+        return [stamp_label(v, key=key) for v in values]
+
+    if tf.bars_per_session == 1:
+        # Daily: the label is the *Eastern* date, which is a calendar-day question
+        # and is therefore not a conversion of the bar's own zone -- the bar is
+        # stamped at the Eastern open, and any other hour of the same session is
+        # the same date.  ``session_et`` is the one definition of that date, so it
+        # is what this calls.
+        dates = session_et(series).dt.strftime("%Y-%m-%d")
+    else:
+        # Intraday: the bar's own instant, converted into the reader's zone.
+        # ``tz_convert`` on a UTC series is the same conversion :func:`stamp_label`
+        # performs on a single bar.
+        dates = series.dt.tz_convert(zone).dt.strftime("%Y-%m-%d %H:%M")
+
+    labels = [str(v) for v in dates]
+    # ``NaT`` stringifies to ``"nan"``; :func:`stamp_label` prints ``"—"`` for a
+    # missing stamp.  Any bar whose label is not a real stamp is redone the slow
+    # way, so the two paths cannot diverge.
+    if any(label == "nan" for label in labels):
+        return [stamp_label(v, key=key) for v in values]
+    return labels
 
 
 def stamp_span(lo: object, hi: object, *, key: object = None) -> str:
@@ -394,15 +480,15 @@ def _proj_ticktext(anchor_ts: pd.Timestamp, offsets: Sequence[int]) -> List[str]
 def active_projection_bounds() -> tuple:
     """``(low, high)`` valid horizons in bars for the active timeframe.
 
-    The Projection tab's projection length is now a *control* rather than a constant, so
+    The Projection tab's projection length is a *control* rather than a constant, so
     its range has to be one the rest of the pipeline can actually honour -- and the
     upper bound is not a round number, because it is set by §BX.
 
-    **On intraday the ceiling is one session, and it is load-bearing.**  §BX drops any
-    candidate whose forward horizon would cross a session closure, on the measured
-    grounds that such a return is really one overnight gap plus ``h - 1`` minutes and
-    reports ~20x a genuine one.  Measured on a 20-session 1-minute fixture at the
-    default 240-bar window::
+    **On intraday the ceiling is one session, and it is load-bearing.**  §BX drops
+    any candidate whose forward horizon would cross a session closure, on the
+    measured grounds that such a return is really one overnight gap plus ``h - 1``
+    minutes and reports ~20x a genuine one.  Measured on a 20-session 1-minute
+    fixture at the default 240-bar window::
 
         h= 20   94.7% of windows admissible
         h= 60   84.1%
@@ -417,13 +503,14 @@ def active_projection_bounds() -> tuple:
     windows wholly inside one session admissible.
 
     **On daily there is no ceiling of this kind, and that asymmetry is the point.**
-    A daily bar *is* a whole session, so a horizon already measures whole sessions and
-    there is no gap for §BX to correct -- :func:`Pipeline.forward_horizon_mask` returns
-    ``None`` outright and :func:`~timeseries.panel._horizon_admissible` returns all-True.
-    Imposing the intraday ceiling on daily would therefore be meaningless rather than
-    merely conservative: it would cap the reader's horizon at "zero trading days"
-    against a number that means nothing there.  Daily is bounded by ``max_query_bars``
-    instead, which is the app's own statement of the widest span readable as a shape.
+    A daily bar *is* a whole session, so a horizon already measures whole sessions
+    and there is no gap for §BX to correct -- :func:`Pipeline.forward_horizon_mask`
+    returns ``None`` outright and :func:`~timeseries.panel._horizon_admissible`
+    returns all-True.  Imposing the intraday ceiling on daily would be meaningless
+    rather than merely conservative: it would cap the reader's horizon at "zero
+    trading days" against a number that means nothing there.  Daily is bounded by
+    ``max_query_bars`` instead, which is the app's own statement of the widest span
+    readable as a shape.
 
     Returned as a pair rather than two accessors because the two bounds come from
     *different* facts and a caller that read them separately could not tell that: the
@@ -515,10 +602,11 @@ def timeframe_scope(key: object):
 #
 # The storage is a ``st.cache_resource`` singleton rather than a plain module-level
 # dict, and that is load-bearing rather than stylistic.  **Streamlit re-runs the script
-# top to bottom on every interaction, in a fresh namespace each time**, so a
-# module-level dict is re-created empty on every single rerun: the "cache" was a cache
-# that never hit.  Measured against the live app, printing the store's ``id()`` once
-# per render -- a different object every time, on every brush:
+# top to bottom on every interaction, in a fresh namespace each time** (see the note
+# on :data:`ACTIVE_TIMEFRAME`), so a module-level dict is re-created empty on every
+# single rerun: the "cache" was a cache that never hit.  Measured against the live
+# app, printing the store's ``id()`` once per render -- a different object every time,
+# on every brush:
 #
 #     id=4908179200 n=41702 chart_from=35862
 #     id=4422744960 n=41702 chart_from=35861
@@ -538,35 +626,6 @@ def timeframe_scope(key: object):
 def _fetch_store() -> Dict[str, "F.FetchResult"]:
     """The process-wide symbol -> fetched-bars store.  See the note above."""
     return {}
-
-# Live-tab state: the newest bar(s) appended to the chart every minute.
-#
-# **Why a module-level dict and not session state.**  The Live tab's tape rolls
-# forward on every rerun, and the rerun trigger is external to Streamlit (a browser
-# poller, see :data:`LIVE_POLL_KEY`).  The appended bar has to survive across reruns
-# and across the fresh namespace each rerun creates, so it lives in a module-global
-# dict keyed by symbol.  It is deliberately *not* a ``st.cache_resource`` entry: the
-# fetch itself is cached in ``_fetch_store``, but the *decision* to append a new bar
-# is a per-rerun comparison of timestamps, and that comparison must be re-evaluated
-# every pass.
-#
-# **Guarded by a timestamp, not a count.**  The fetch returns the same frame as long
-# as the market is closed, so comparing ``len`` would never fire.  We compare the last
-# timestamp in the fetched frame against the last timestamp we have already drawn; a
-# newer timestamp means the tape advanced and we append.  This also means the append
-# is idempotent: rerunning while the same bar is the newest is a no-op.
-#
-# **One bar at a time, but we keep the window.**  We store the full ``(x, y)`` of the
-# appended bars so the figure renderer can draw them; the Live tab only ever appends
-# a single bar per poll, so the tuple holds one element.
-LIVE_STORE: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
-
-# Session-state key the browser poller writes to trigger a rerun.  The poller sets
-# this key every N seconds; Streamlit reruns the script when it changes, and the
-# script clears it at the end of the pass so the next poll fires again.  It is a
-# *widget* key (a hidden text input) because only registered widgets persist in
-# session_state across reruns.
-LIVE_POLL_KEY = "live_poll_trigger"
 
 # Root of the many-ticker Parquet archive the Panel tab reads.  The single-instrument
 # tabs never touch disk: their bars are downloaded and held in memory, so this is the
@@ -606,6 +665,25 @@ def panel_root_for(timeframe: object = None) -> str:
     """
     tf = resolve_timeframe(timeframe if timeframe is not None else ACTIVE_TIMEFRAME[0])
     return PANEL_ROOT if tf.bars_per_session > 1 else DAILY_ROOT
+
+
+def _within_fetch_window(session: str, *, days: int = 30) -> bool:
+    """Is ``session`` (YYYY-MM-DD) still inside Yahoo's minute-bar fetch window?
+
+    Yahoo serves roughly the last 30 days of 1-minute history.  That limit is on
+    *fetching*, not on *keeping* -- so a session older than the window cannot be
+    downloaded, and saying so is the difference between "press the button" and
+    "it is too late".
+
+    The daily archive has no such wall, so this is only meaningful for the
+    intraday panel.  The caller decides which archive it is talking about.
+    """
+    try:
+        day = pd.Timestamp(session).tz_localize(EASTERN).date()
+    except (TypeError, ValueError):
+        return False
+    age = (pd.Timestamp.now(tz=EASTERN).date() - day).days
+    return age <= days
 
 
 def download_script_name(timeframe: object = None) -> str:
@@ -699,33 +777,6 @@ def active_max_query_bars() -> int:
 def active_view_sessions() -> int:
     return _tf().view_sessions
 
-# Longest window the sidebar offers.  This is a *readability* bound, not a validity
-# one -- unlike ``MIN_QUERY_BARS``, nothing breaks past it, which is exactly why it
-# needs saying out loud: a cap is a decision about what reads well, and a reader who
-# wants a 600-bar window should be told the app is declining rather than left to find
-# the slider's end.
-#
-# It exists because the matched window is drawn *inside* a panel sized by the days
-# slider, and that panel tops out around 1,950 bars at five days.  Measured on the
-# standard fixture, the matched window's share of that panel is what decides whether it
-# reads as a shape or a stripe:
-#
-#     120 bars -> 6.2%    180 -> 9.2%    240 -> 12.3%    390 -> 20.0%
-#
-# 240 is the default (``DEFAULT_LENGTH``), and 12.3% sits comfortably inside the
-# readable range: the default match is a shape rather than a stripe, and the reader
-# still has 150 bars of headroom on the slider before the cap.
-#
-# 390 is one full 1-minute session, and 20% is where the chart's own guidance draws the
-# line between "a readable shape" and "a slab".  Beyond that the match starts filling
-# the panel and flattens out, which is the same failure the Price tab had when it sized
-# itself from ``CONTEXT_BARS`` instead of the sidebar's view.
-#
-# Note this does not bound a *brushed* window: a drag defines its own length, and the
-# matcher will happily score a 900-bar span.  Only the sidebar slider is capped, so a
-# reader who brushes a long window is not blocked -- they simply get whatever they drew.
-MAX_QUERY_BARS = 390
-
 # =============================================================================== #
 # Forecast-path chart
 # =============================================================================== #
@@ -737,13 +788,21 @@ MAX_QUERY_BARS = 390
 # change shape whenever a default worth revisiting is changed for the sake of the
 # query.
 #
-# History and projection are equal at 240 on purpose.  A 240-bar window is ~4 hours of
-# a 390-bar session, so the chart shows roughly one session of tape and then one
-# session's worth of what came next: the reader gets a shape to recognise on the left
-# and an equally long answer on the right, and the projection cannot be dwarfed by the
-# history it hangs off.
-FORECAST_HISTORY_BARS = 240
-FORECAST_PROJECTION_BARS = 240
+# **Both sizes come from the active timeframe, not from a literal here.**  They used
+# to be module constants (``FORECAST_HISTORY_BARS`` / ``FORECAST_PROJECTION_BARS``,
+# both 240), which was the 1-minute calibration written into the app rather than read
+# from the registry that owns it -- and it was wrong on daily, where the values are 60
+# and 20.  Every call site already resolves the live value through
+# :func:`_tf`; these accessors are the named form of that, so the app has one place
+# that says what the forecast chart is sized at.
+def forecast_history_bars() -> int:
+    """Bars of real tape drawn behind the projection, for the active timeframe."""
+    return _tf().forecast_history_bars
+
+
+def forecast_projection_bars() -> int:
+    """Bars projected past the history, for the active timeframe."""
+    return _tf().forecast_projection_bars
 
 # Granularity of the Projection tab's *Recent bars* control, in bars.
 #
@@ -1054,7 +1113,7 @@ EASTERN = "America/New_York"
 
 CHANNEL_LABELS = FEATURE_COLUMNS
 
-# "Price" leads and is named as the landing view by ``DEFAULT_TAB``: it shows the
+# "Live" leads and is named as the landing view by ``DEFAULT_TAB``: it shows the
 # tape and nothing else, so the app opens on data rather than on controls.
 # Everything else is opt-in depth.
 #
@@ -1103,8 +1162,22 @@ CHANNEL_LABELS = FEATURE_COLUMNS
 # of those keys at once and discard every reader's brush, settings and last run on
 # deploy, for no behaviour change.  A future reader who finds ``FORECAST_BRUSH_KEY``
 # "mislabelled" against the *Forecast* tab should leave it alone.
-TAB_ORDER = ("Price", "Matches", "Projection", "Forecast", "Live", "Panel", "Quality",
-             "Backtest")
+#: The tabs, in the order they are drawn.
+#:
+#: **"Progression" sits after "Forecast" and before "Live".**  The position is
+#: load-bearing in one direction only: ``FORECAST_SELECTION_KEY`` records that a
+#: plotly chart's element id hashes the page's **chart list**, so moving *Forecast*
+#: away from immediately after *Projection* changes how many charts precede it and
+#: invalidates every brush selection a reader has already made.  That constraint is
+#: pinned by ``test_forecast_sits_immediately_after_projection_in_the_tab_order``.
+#:
+#: The element id itself is safe against *editing* this file: it is derived from
+#: ``calc_hash(main_script_path)``, which hashes the script's **path**, not its
+#: contents.  What it is not safe against is changing the *number of charts rendered
+#: before* a given one -- which is why the position above is pinned rather than
+#: chosen.
+TAB_ORDER = ("Price", "Matches", "Projection", "Forecast", "Live",
+             "Panel", "Quality", "Backtest")
 
 # How much tape the Price tab shows, in trading sessions.
 #
@@ -1185,7 +1258,6 @@ PIPE_LENGTH_FOR_HELP: List[int] = [DEFAULT_LENGTH]
 SYMBOL_FOR_HELP: List[str] = [DEFAULT_SYMBOL]
 
 HELP_ICON = "❓"
-STEP_ICON = "🧭"
 
 TAB_GUIDE: Dict[str, str] = {
     "Price": (
@@ -1490,8 +1562,53 @@ TAB_GUIDE: Dict[str, str] = {
         "**Next:** if this survives, sanity-check it against an entirely independent "
         "run in the *Backtest* tab."
     ),
+    "Progression": (
+        "### 5. The same question at fifty different lookbacks\n\n"
+        "Every other tab answers one question at one length. This one asks the *same* "
+        "question about the *same* moment at fifty lengths, and draws all fifty "
+        "answers at once.\n\n"
+        "**What is computed**\n\n"
+        "For each lookback length $L$ — 10 bars, 20 bars, 30 bars, and so on up to 500 "
+        "— the archive's own most recent $L$ bars are matched against the archive's "
+        "history, and the matched windows' forward paths are projected over "
+        "[[PROGRESSION_HORIZON]] bars. All fifty projections are drawn on one chart.\n\n"
+        "**Why one chart and not fifty rows.**  The finding is the *shape* of the "
+        "answer across lengths, not any single length's number. When the short "
+        "lookbacks project one way and the long ones project another, the "
+        "disagreement is visible in the spread of the traces and invisible in a "
+        "table. The table below the chart has the numbers for when you want them "
+        "exactly.\n\n"
+        "**Reading it**\n\n"
+        "* the **blue line on the left** is the real tape — the archive's most recent "
+        "bars, rebased to the last close so it meets the projections at exactly zero.\n"
+        "* the **pale traces are short lookbacks and the dark ones are long.** The "
+        "colour ramp is ordered by lookback length, so it carries meaning: if the "
+        "dark traces and the pale traces disagree, the recent tape is saying "
+        "something the longer history does not confirm.\n"
+        "* the **red line is the median across all the lookbacks** — what they agree "
+        "on. Fifty overlapping traces cannot be read by eye, so the middle of the "
+        "cloud is computed and drawn.\n"
+        "* the **dashed line** is where the projection starts, the same convention as "
+        "every other chart in this app.\n\n"
+        "**Everything is in percent from the last close.** That is what lets fifty "
+        "projections share one axis: each matched window is rebased to *its own* "
+        "final close, so a trace describes the percentage move that followed, not the "
+        "price level it happened at.\n\n"
+        "**The Matches column is the honest part.**  A long lookback cannot always "
+        "get thirty matches. Non-max suppression (§M) requires one full lookback of "
+        "separation between accepted windows, so a 500-bar lookback can only place a "
+        "handful of windows in an archive of this size — and a median over seven "
+        "windows is a materially thinner claim than a median over thirty. The table "
+        "reports the count for every length, and lengths that could not be projected "
+        "at all are listed with the reason rather than silently dropped.\n\n"
+        "**This tab is a reference, not a query.**  Every length asks about the "
+        "archive's most recent bars, so the chart stays put while you explore other "
+        "windows elsewhere. It forecasts the **Forecast** tab's instrument at the "
+        "Forecast tab's resolution.\n\n"
+        "**Next:** the *Backtest* tab, for whether any of this survives out of sample."
+    ),
     "Quality": (
-        "### 5. Check the data before you trust any of it\n\n"
+        "### 6. Check the data before you trust any of it\n\n"
         "Every number in this app descends from the bars loaded here. Read this tab "
         "first when a result looks surprising.\n\n"
         "**The keys in the JSON, and what each one should be**\n\n"
@@ -1521,7 +1638,7 @@ TAB_GUIDE: Dict[str, str] = {
         "**Next:** data sane? Go back to *Price* and run a match."
     ),
     "Backtest": (
-        "### 6. Test whether the whole thing has any edge at all\n\n"
+        "### 7. Test whether the whole thing has any edge at all\n\n"
         "The Forecast tab is in-sample by construction: you chose the query, then "
         "measured what happened after it. The backtest asks the harder question — *out "
         "of sample, would matching have predicted direction better than guessing?*\n\n"
@@ -1672,11 +1789,44 @@ def fill_tokens(text: str) -> str:
                      if _tf().gap_seconds is not None else "threshold")
             .replace("[[FORECAST_HISTORY_BARS]]", str(_tf().forecast_history_bars))
             .replace("[[FORECAST_PROJECTION_BARS]]", str(_tf().forecast_projection_bars))
-            .replace("[[FORECAST_PATH_MATCHES]]", str(FORECAST_PATH_MATCHES)))
+            .replace("[[FORECAST_PATH_MATCHES]]", str(FORECAST_PATH_MATCHES))
+            # The Progression tab's own horizon.  Its own token rather than
+            # ``[[FORECAST_PROJECTION_BARS]]`` because it is a *different* number:
+            # the Projection slider governs the reference path, and this sweep
+            # projects 300 bars on its own account.  Sharing a token would make
+            # one control's value describe two unrelated charts.
+            .replace("[[PROGRESSION_HORIZON]]", str(PROGRESSION_HORIZON)))
 
 
 def guide(key: str) -> None:
-    pass
+    """The tab's own how-to, drawn as a collapsed panel above the tab's content.
+
+    **This was a no-op, and the whole of :data:`TAB_GUIDE` was unreachable because
+    of it.**  The function body was ``pass``, so the seven ``guide("...")`` call
+    sites -- one per tab -- rendered nothing at all, and the 385 lines of prose in
+    :data:`TAB_GUIDE` were carried in the file for no reader to ever see.  The
+    call sites and the dict were both kept and documented as if the panel rendered;
+    only the body was missing.
+
+    **Collapsed by default, deliberately.**  The Price tab's whole job is to put the
+    tape in front of the reader with nothing between them, so a long how-to has to be
+    one click away rather than in the way.  The panel is a disclosure, not a section.
+
+    The prose is passed through :func:`fill_tokens` so the numbers it quotes are the
+    ones actually in force -- the live window length, the instrument on screen, the
+    resolution, and the forecast chart's sizes.  A guide that quoted a stale
+    constant would be worse than no guide, because it would be *checkable* and
+    wrong.
+
+    **A key with no entry draws nothing**, rather than an empty panel: a tab whose
+    guide has not been written yet should show no expander at all, not a heading
+    the reader can open to find it empty.
+    """
+    text = TAB_GUIDE.get(key)
+    if not text:
+        return
+    with st.expander("How to use this tab", icon=HELP_ICON):
+        st.markdown(fill_tokens(text))
 
 
 HELP_DIALOG_TITLE = "How to use this app"
@@ -1721,10 +1871,13 @@ def help_dialog() -> None:
         "| 4 | **Forecast** | Read what followed a window **you** drew, always against a "
         "random-window baseline. It has its **own ticker input** at the top of the "
         "tab, so it can forecast a different company than the tape on *Price* |\n"
-        "| 5 | **Panel** | A cross-sectional search you drive yourself — pick the "
+        "| 5 | **Progression** | The same question asked at fifty lookbacks: what "
+        "usually followed this tape, and does the answer change with how much history "
+        "you look back? All fifty projections are drawn on one chart |\n"
+        "| 6 | **Panel** | A cross-sectional search you drive yourself — pick the "
         "ticker and window, then see every analogue in the index with three ranks |\n"
-        "| 6 | **Quality** | Confirm the underlying bars are sound |\n"
-        "| 7 | **Backtest** | Test out-of-sample whether any of it beats a coin flip |\n\n"
+        "| 7 | **Quality** | Confirm the underlying bars are sound |\n"
+        "| 8 | **Backtest** | Test out-of-sample whether any of it beats a coin flip |\n\n"
         "A 60-second tour:\n\n"
         "1. Leave the ticker boxes at their defaults — the app opens on the newest window, "
         "over the last five trading sessions. Both boxes sit at the **top of the "
@@ -1875,9 +2028,10 @@ def fetch_ticker_cached(symbol: str, *, refresh: bool = False,
     plain dict instead -- but reached through ``_fetch_store()``, a
     ``cache_resource`` singleton, because a **module-level dict is re-created empty on
     every rerun** (Streamlit re-executes the script in a fresh namespace per
-    interaction) and would therefore never hit at all.  That made every brush
-    re-download ~29 days of 1-minute bars and let the live archive grow mid-session,
-    which moved the trailing view by a bar each time and read as the chart scrolling.
+    interaction -- see the note on :data:`ACTIVE_TIMEFRAME`) and would therefore
+    never hit at all.  That made every brush re-download ~29 days of 1-minute bars
+    and let the live archive grow mid-session, which moved the trailing view by a bar
+    each time and read as the chart scrolling.
     See the note above the store's definition.
 
     **Keyed on the timeframe as well as the symbol.**  This was the one genuinely
@@ -1957,132 +2111,238 @@ def pipeline_from_frame(cache_key: str, frame: pd.DataFrame, length: int,
     return Pipeline.from_frame(frame, length=length, timeframe=resolve_timeframe(timeframe).key)
 
 
-# The whole ``run()`` output is intentionally NOT cached: it depends on the query
-# span, which the user chooses interactively, and caching it would hide the very
-# baseline comparison the UI exists to show.
-
-
 # =============================================================================== #
 # Small helpers
 # =============================================================================== #
+def _finite_float(x: object) -> Optional[float]:
+    """``x`` as a finite float, or ``None`` if it is not one.
+
+    The guard both formatters need: a value that cannot be read as a number, or that
+    is a number but not finite (``NaN``, ``inf``), renders as an em dash rather than
+    as a number.  Written once because the two callers were identical line for line,
+    and two copies of a rule about what a missing number looks like is one more copy
+    to forget to update.
+    """
+    try:
+        v = float(x)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return v if np.isfinite(v) else None
+
+
 def bps(x: float) -> str:
     """Format a return as basis points.  NaN renders as an em dash, not as a number."""
-    try:
-        v = float(x)
-    except (TypeError, ValueError):
-        return "—"
-    if not np.isfinite(v):
+    v = _finite_float(x)
+    if v is None:
         return "—"
     return "{:+.2f} bps".format(v * 1e4)
 
 
 def pct(x: float) -> str:
     """Format a percentile rank, e.g. 0.0011 -> '0.11%'."""
-    try:
-        v = float(x)
-    except (TypeError, ValueError):
-        return "—"
-    if not np.isfinite(v):
+    v = _finite_float(x)
+    if v is None:
         return "—"
     return "{:.2f}%".format(v * 100.0)
+
+
+def resolve_bar_index(pipe: Pipeline, ts: object) -> Optional[int]:
+    """The bar index in ``pipe`` whose timestamp is ``ts``, or ``None``.
+
+    **The index of a *moment*, found by looking the moment up.**  This is the
+    counterpart to storing an anchor as a timestamp: the archive's bar indices are
+    not stable across refreshes (the cleaned frame's warm-up rows shift as bars
+    arrive), so an index captured earlier can point at a different bar later.  The
+    timestamp does not drift, so it is the thing that gets stored, and this function
+    is what turns it back into an index against *this* pass's frame.
+
+    **Searched, not matched exactly.**  A bar is found by locating the first bar at
+    or after ``ts``.  An exact match is the normal case; the search is what makes the
+    lookup survive a frame whose first bars have been trimmed, where the stored
+    timestamp may now sit just outside the cleaned frame entirely.
+
+    **A moment that has aged out is *not* found.**  This is the case that makes the
+    search safe rather than merely lenient.  ``searchsorted`` with a target older
+    than every bar returns ``0`` -- the first bar of the frame -- so a naive search
+    would answer "the pinned bar is the first bar" for a pin that is no longer in
+    the archive at all, and the chart would silently re-anchor on a *different* bar.
+    That is the exact failure a pinned tab must not have, so a target that precedes
+    the frame is reported as missing rather than resolved to the frame's front.
+
+    Returns ``None`` when the moment is no longer in the archive at all -- a frame
+    that shrank past the anchor, or an empty frame.  The caller treats that as
+    "cannot honour the pin" and re-anchors, rather than drawing a chart whose left
+    edge is a guess.
+    """
+    if ts is None or pipe is None or pipe.n_bars == 0:
+        return None
+    try:
+        stamp = pd.Timestamp(ts)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(stamp):
+        return None
+
+    stamps = pipe.bars["timestamp"]
+    if stamps.empty:
+        return None
+
+    # Compare on a common footing.  ``searchsorted`` needs both sides to agree on
+    # timezone awareness, and the archive is UTC by contract while ``stamp`` may
+    # arrive in any zone, so the target is converted to UTC before the comparison.
+    try:
+        target = (stamp.tz_convert("UTC") if stamp.tzinfo is not None
+                  else stamp.tz_localize("UTC"))
+        series = (stamps.dt.tz_convert("UTC")
+                  if getattr(stamps.dt, "tz", None) is not None else stamps)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+    try:
+        pos = int(series.searchsorted(target, side="left"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if pos >= len(series):
+        return None
+
+    # **The moment has aged out.**  The target is older than the frame's first bar,
+    # so there is no bar at or after it *because the archive no longer reaches that
+    # far back*.  Resolving to the frame's front would anchor the chart on a bar
+    # the reader never pinned, so this is reported instead.
+    try:
+        if target < series.iloc[0]:
+            return None
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return pos
 
 
 # =============================================================================== #
 # Live tab: rolling tape, frozen projection
 # =============================================================================== #
-def live_store_key(symbol: str) -> str:
-    """Session-state key for the live tab's poll trigger."""
-    return LIVE_POLL_KEY
 
 
-def live_append_key(symbol: str) -> str:
-    """Module-global key for the live tab's appended bars (symbol -> (x, y))."""
-    return "live_bars_{}".format(str(symbol).upper())
+
+#: Session-state key for the Live tab's pinned **anchor** -- the bar its frozen
+#: projection grows out of.
+LIVE_ANCHOR_KEY = "live_anchor_ts"
+
+#: Session-state key for the Live tab's pinned **history start** -- the first bar
+#: on screen.
+LIVE_HIST_START_KEY = "live_hist_start_ts"
+
+#: Session-state key for the Live tab's **frozen projection**.
+#:
+#: The path is a *value*, not an index, and it is stored whole.  Recomputing it
+#: on every poll would re-run the match search against a moving query window and
+#: produce a *different* forecast each minute -- which is the opposite of the
+#: frozen projection the tab promises.  What is stored is the path itself, so
+#: every poll draws the same forecast while the tape rolls past it.
+LIVE_PATH_KEY = "live_path"
+
+#: Session-state key for the Live tab's **frozen closest match** -- the orange
+#: trace's own forward series, in percent from the match's anchor close.
+#:
+#: **It is stored for the same reason the path is, and for one more.**
+#:
+#: Freezing the path was not enough, because the *line drawn from it* was never
+#: frozen: the orange trace was re-derived on every poll by slicing the
+#: **current** archive at ``path.starts[0]`` -- a bar *index*.  The archive's
+#: index space is not stable: as old bars age out of the front, that index
+#: names a *different* bar, so the drawn projection changed even though the
+#: forecast had not.  A frozen forecast drawn from a moving index is not a
+#: frozen forecast.
+#:
+#: So the series is stored as a **value**, exactly like the path, and the
+#: figure draws it as it was frozen.  The two are written together and read
+#: together, because a path and a series derived from *different* archives are
+#: not the same forecast.
+LIVE_MATCH_KEY = "live_match"
 
 
-def live_last_ts_key(symbol: str) -> str:
-    """Module-global key for the last timestamp already drawn (symbol -> Timestamp)."""
-    return "live_last_ts_{}".format(str(symbol).upper())
+def live_state_key(symbol: str, base: str) -> str:
+    """Session-state key for one piece of Live-tab state, per symbol.
+
+    Namespaced by symbol *and* resolution.  The symbol is part of the key because
+    every one of these values describes a moment in one instrument's tape; the
+    resolution suffix comes from :func:`state_key`, because a bar index means
+    nothing across resolutions.
+    """
+    return state_key("{}_{}".format(base, str(symbol).upper()))
 
 
-def live_get_bars(symbol: str) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """Return the appended bars for ``symbol``, or ``None`` if none yet."""
-    return LIVE_STORE.get(live_append_key(symbol))
-
-
-def live_set_bars(symbol: str, x: np.ndarray, y: np.ndarray) -> None:
-    """Record the appended bars for ``symbol``."""
-    LIVE_STORE[live_append_key(symbol)] = (x, y)
-
-
-def live_set_last_ts(symbol: str, ts: pd.Timestamp) -> None:
-    """Record the last timestamp already drawn for ``symbol``."""
-    LIVE_STORE[live_last_ts_key(symbol)] = ts
-
-
-def live_last_ts(symbol: str) -> Optional[pd.Timestamp]:
-    """The last timestamp already drawn for ``symbol``, or ``None``."""
-    v = LIVE_STORE.get(live_last_ts_key(symbol))
-    if isinstance(v, pd.Timestamp):
-        return v
-    return None
-
-
-def live_append_new_bar(
+def live_pinned_anchor(
     pipe: Pipeline,
     symbol: str,
-    *,
     recent_bars: int,
-) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """Append the newest bar to the live chart if the tape has advanced.
+) -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
+    """The Live tab's pinned ``(anchor, history_start)``, as timestamps.
 
-    Returns ``(x, y)`` for the appended bar, or ``None`` if nothing new has arrived
-    since the last rerun.  The check is timestamp-based: the fetch returns the same
-    frame while the market is closed, so a length comparison would never fire.
+    **The anchor** is the last bar the frozen projection grows out of -- the
+    archive's newest bar at the moment the reader arrived.  **The history
+    start** is the first bar on screen, ``recent_bars`` earlier.
 
-    The new bar is appended at the *current* tail of the pipeline's close series,
-    extending the history trace by one bar.  The projection is anchored at load time
-    and is unaffected.
+    **Both are moments, never bar indices.**  The archive's indices are not
+    stable across a refresh: the cleaned frame drops a different number of
+    warm-up rows, and the window rolls forward as old bars age out, so an index
+    stored today names a *different bar* on the next poll.  A stored index
+    therefore does not merely fail to stay still -- it drifts, and the frozen
+    projection ends up attached to the wrong moment.
+
+    **The pin is taken once** and survives every poll, which is what makes the
+    projection genuinely frozen rather than re-derived from a moving tail.  It
+    is re-taken only when the reader moves the *Recent bars* control, which is
+    a deliberate gesture to re-aim the whole chart.
+
+    Returns ``(None, None)`` when there is no archive to pin yet.
     """
-    n = pipe.n_bars
-    if n == 0:
-        return None
+    anchor_key = live_state_key(symbol, LIVE_ANCHOR_KEY)
+    start_key = live_state_key(symbol, LIVE_HIST_START_KEY)
+    width_key = live_state_key(symbol, "live_recent_bars_width")
+    state = st.session_state
 
-    last_ts = live_last_ts(symbol)
-    new_ts = pd.Timestamp(pipe.bars["timestamp"].iloc[-1])
+    n = max(1, int(recent_bars))
 
-    # Nothing new: the fetch returned the same frame as last time (market closed, or
-    # the same bar is still the newest).  Idempotent across reruns.
-    if last_ts is not None and new_ts <= last_ts:
-        return None
+    if pipe is None or pipe.n_bars == 0:
+        return state.get(anchor_key), state.get(start_key)
 
-    # The new bar's price.  We take the close of the last bar of the pipeline's
-    # cleaned frame -- the same ``close`` series the chart already draws -- so the
-    # appended bar is byte-identical to what a reader would see on the Price tab.
-    new_close = float(pipe.close[-1])
-    if not np.isfinite(new_close) or new_close <= 0:
-        return None
+    # Re-pin only on a deliberate change of the control's value.  A poll that
+    # brings new bars is *not* a change of intent and must not move the pin.
+    width = state.get(width_key)
+    needs_pin = state.get(anchor_key) is None
+    if not needs_pin and width is not None and int(width) != n:
+        needs_pin = True
 
-    # x-position: the next integer index past the current history.  The chart's
-    # history trace is drawn on integer bar indices, so the appended bar lands at
-    # hist_start + hist (i.e. n), exactly where the rolling window would extend.
-    new_x = np.array([n], dtype=np.int64)
-    new_y = np.array([new_close], dtype=float)
+    if needs_pin:
+        # The anchor is the archive's newest bar; the history start is
+        # ``recent_bars`` earlier.  Both clamped into the frame.
+        anchor_index = pipe.n_bars - 1
+        start_index = max(0, anchor_index + 1 - n)
+        state[anchor_key] = pipe.bars["timestamp"].iloc[anchor_index]
+        state[start_key] = pipe.bars["timestamp"].iloc[start_index]
+        state[width_key] = n
 
-    live_set_bars(symbol, new_x, new_y)
-    live_set_last_ts(symbol, new_ts)
-    return (new_x, new_y)
+    return state.get(anchor_key), state.get(start_key)
 
 
-def live_poll_widget() -> None:
-    """Register the browser poller's trigger key.
+def _live_path_is_stale(path: Any, recent_bars: int, projection_bars: int) -> bool:
+    """Is the stored Live projection no longer the one the controls ask for?
 
-    The poller (a tiny JS snippet injected below) writes this key every N seconds;
-    Streamlit reruns the script when it changes, and the script clears it at the end
-    of the pass so the next poll fires again.  The key is registered here so it
-    survives a ``session_state`` wipe and the Live tab can read it.
+    The projection is frozen, so it is *not* recomputed on every poll -- but it
+    **must** be recomputed when the reader changes what they asked for, or the
+    chart would keep showing a forecast built at the old width against a
+    history drawn at the new one.  That is the one case where "frozen" would
+    be a lie rather than a promise.
+
+    A path is stale when its window length no longer matches *Recent bars* or
+    its horizon no longer matches *Projection bars*.  Both are read off the
+    path itself, so the check cannot drift from what is actually drawn.
     """
-    st.text_input(key=LIVE_POLL_KEY, label="Live poll trigger", label_visibility="hidden", value="", help="Live poll trigger")
+    if path is None:
+        return True
+    length = int(getattr(path, "length", 0) or 0)
+    horizon = int(getattr(path, "horizon", 0) or 0)
+    return length != int(recent_bars) or horizon != int(projection_bars)
 
 
 def chart_config(*, selectable: bool = False) -> Dict[str, Any]:
@@ -2477,18 +2737,14 @@ def build_price_figure(pipe: Pipeline, view_start: int, view_stop: int,
         set and the two curves can be compared without mentally rescaling.
 
     ``selectable``
-        Arm the box/lasso drag that *defines the query window*.  Only the one chart
-        the app actually reads a selection from can honour it -- the Price tab's
-    top chart, which is the app's only query control.
-        selection chart and the Price tab's top chart, both rendered with
-        ``on_select``.  Everywhere else the brush would draw a box that no code path
-        ever looks at, so a display chart passes ``False``: the pointer becomes a
-        pan/zoom drag instead, and the modebar's select buttons are stripped by
-        :func:`chart_config`.
+        Arm the box/lasso drag that *defines the query window*.  Only the Price tab's
+        top chart -- the app's only query control -- is rendered with ``on_select``.
+        Everywhere else the brush would draw a box that no code path ever looks at,
+        so a display chart passes ``False``: the pointer becomes a pan/zoom drag
+        instead, and the modebar's select buttons are stripped by :func:`chart_config`.
 
     ``rebase_at`` and ``y_range`` are no-ops when neither is passed, so a caller can
     keep the raw tape if it has no rebased panel underneath to agree with.
-    price view it has always shown.
 
     The three ``pan_*`` arguments belong to the Price tab's match panel and are the
     only reason this function knows about panning at all.  All three are inert by
@@ -2568,7 +2824,7 @@ def build_price_figure(pipe: Pipeline, view_start: int, view_stop: int,
     if base is None:
         y_close, y_upper, y_lower, y_mid = price, upper, lower, mid
         y_label = "close"
-        close_hover = "%{x}<br>close %{y:.2f}<extra></extra>"
+        close_hover = "%{customdata}<br>close %{y:.2f}<extra></extra>"
     else:
         # Multiplied by 100 so the axis reads in real percentage points (-0.23%). A raw
         # 0.0n fraction beside a "(%)" label is a unit lie the eye cannot parse.
@@ -2579,13 +2835,28 @@ def build_price_figure(pipe: Pipeline, view_start: int, view_stop: int,
         # Kept short: a long axis title is clipped at these panel heights, and the
         # panel title already spells out what the rebasing is.
         y_label = "price"
-        close_hover = "%{x}<br>close %{y:.2f}<extra></extra>"
+        close_hover = "%{customdata}<br>close %{y:.2f}<extra></extra>"
+
+    # **The hover says *when*, not *which bar*.**
+    #
+    # The x axis is the bar index -- deliberately, so the closed market occupies no
+    # horizontal space -- and the hover used to print that same index.  A reader
+    # hovering a bar learned "this is bar 1015" and had to go and find 1015 on the
+    # axis to learn *when* it was.  The stamp is already printed on the axis, so the
+    # hover can print it directly and the reader never has to make the translation
+    # at all.
+    #
+    # The stamps are carried on ``customdata`` rather than in the template's ``%{x}``
+    # because the x value *is* the index: there is no timestamp in it to print.
+    stamps = stamp_labels(pipe.bars["timestamp"].iloc[data_start:data_stop],
+                          key=pipe.timeframe)
 
     if draw_candles:
         fig.add_trace(go.Scatter(
             x=x_vals, y=y_close, mode="lines",
             line=dict(color="#1f77b4", width=1.1),
             name="close", hovertemplate=close_hover,
+            customdata=stamps,
         ))
 
     # One band polygon, because there is nothing being joined across a gap. A
@@ -2647,6 +2918,26 @@ def build_price_figure(pipe: Pipeline, view_start: int, view_stop: int,
         # Half a bar of padding keeps the first and last labels off the axis ends,
         # where they would otherwise be clipped by the plot border.
         range=[view_start - 0.5, view_stop - 0.5],
+        # **The unified hover box's *title* is what printed the bar number.**
+        #
+        # With ``hovermode="x unified"`` the box has two parts: a title, which
+        # plotly.js fills with the hovered x value, and one entry per trace, which
+        # the trace's own ``hovertemplate`` fills.  Putting the stamp in the trace's
+        # template therefore fixed only the entry -- the title above it still read
+        # "1015", and the bar number was the more prominent of the two.
+        #
+        # The title is a *template* of its own, and it cannot see ``customdata``: its
+        # scope is limited to the x value.  So the title cannot be told to print the
+        # stamp -- it can only be told to print something else, or to print nothing.
+        #
+        # ``%{xother}`` does the latter.  It is the x value of the *other* traces at
+        # this position, which on a chart where every trace shares one x axis is
+        # undefined; plotly.js resolves an undefined variable in a template to the
+        # empty string rather than falling back to the x value, so the title renders
+        # as nothing at all and the box collapses to its trace entries -- which
+        # carry the stamp.  An *empty* ``text`` does not work: plotly.js treats that
+        # as "no template" and falls back to the x value, which is the bar number
+        # again.
     )
 
     # ``minallowed``/``maxallowed`` are what stop the pan running off into blank space.
@@ -3518,6 +3809,100 @@ def _closest_match_path(close: np.ndarray, path: Any) -> Optional[np.ndarray]:
     return (window / base - 1.0) * 100.0
 
 
+def _freeze_closest_match(close: np.ndarray, path: Any) -> Dict[str, Any]:
+    """The closest match's own forward series, frozen as a **value**.
+
+    :func:`_closest_match_path` reconstructs the best match's forward path by
+    slicing ``close`` at ``path.starts[0]`` -- a bar *index*.  That index is only
+    meaningful against the archive the path was computed from: as old bars age
+    out of the front, the same index names a *different* bar, so the series
+    re-read from a later archive is a different series.  The **Live** tab
+    therefore stores the series itself, next to the path, and draws the stored
+    one -- a frozen forecast drawn from a moving index is not a frozen forecast.
+
+    **The record says which path it belongs to.**  ``length`` and ``horizon`` are
+    carried so a series can be checked against the path it was frozen with --
+    see :func:`_frozen_match_is_usable`.  A path and a series from *different*
+    archives are not the same forecast and must never be drawn as one.
+
+    **The series is kept in percent from the match's own anchor close**, which is
+    the unit :func:`_closest_match_path` returns and the unit the figure rebases
+    onto the query's anchor.  Storing the rebased *price* instead would freeze
+    the query's close into the record and leave the figure guessing which of
+    the two closes to use.
+
+    ``series`` is ``None`` when the match could not be reconstructed -- a
+    legitimate answer, and one that must *stay* ``None``.  Re-deriving it on a
+    later archive could resurrect the line on a bar that is not the one that was
+    matched, which is the same bug wearing a different hat.
+    """
+    series = _closest_match_path(close, path)
+    return {
+        "length": int(getattr(path, "length", 0) or 0),
+        "horizon": int(getattr(path, "horizon", 0) or 0),
+        "series": None if series is None else np.asarray(series, dtype=float),
+    }
+
+
+def _frozen_match_is_usable(frozen: Any, path: Any) -> bool:
+    """Is a frozen closest-match record the one that belongs to *this* path?
+
+    A record is usable when it is a record at all, and when it was frozen
+    against a path with the same window length and horizon.  Both numbers are
+    read off the path itself, so the check cannot drift from what is drawn.
+
+    It exists for one situation: a session whose path was stored by an older
+    build, before the match was frozen alongside it.  Such a path has no record,
+    so the pair has to be rebuilt -- from the *same* archive and *together*, so
+    the two can never disagree.
+    """
+    if not isinstance(frozen, dict) or path is None:
+        return False
+    try:
+        length = int(frozen.get("length", -1))
+        horizon = int(frozen.get("horizon", -1))
+    except (TypeError, ValueError):
+        return False
+    return (length == int(getattr(path, "length", -2))
+            and horizon == int(getattr(path, "horizon", -2)))
+
+
+def _frozen_or_rebuilt_match(
+    frozen: Optional[Dict[str, Any]],
+    close: np.ndarray,
+    path: Any,
+) -> Optional[np.ndarray]:
+    """The closest match's forward series: the frozen one if there is one.
+
+    **The frozen series wins, always.**  It was captured against the archive the
+    path was computed from, so it is the series that *belongs* to the forecast --
+    a re-derived one would be read from a later archive, at a bar index that has
+    since come to mean something else.
+
+    The frozen record is used when it is *usable*: a record at all, and one
+    frozen against a path with the same length and horizon (see
+    :func:`_frozen_match_is_usable`).  A record that fails the check describes a
+    different forecast, and drawing it next to this path would be worse than
+    drawing nothing.
+
+    **Otherwise the series is rebuilt from the current archive**, exactly as it
+    was before the freezing existed -- so the Forecast tab, the panel forecast and
+    the brushed chart are unchanged, and a *Live* session whose record is missing
+    (an older build, or a path stored before the record existed) still draws a
+    line rather than nothing.
+
+    **A frozen ``series`` of ``None`` stays ``None``.**  The record says the match
+    could not be reconstructed at freeze time; re-deriving it now could
+    resurrect the line on a bar that is not the one that was matched.
+    """
+    if isinstance(frozen, dict) and _frozen_match_is_usable(frozen, path):
+        series = frozen.get("series")
+        if series is None:
+            return None
+        return np.asarray(series, dtype=float)
+    return _closest_match_path(close, path)
+
+
 def build_forecast_path_figure(
     pipe: Pipeline,
     path: Any,
@@ -3528,8 +3913,9 @@ def build_forecast_path_figure(
     window: Optional[Tuple[int, int]] = None,
     show_median: bool = True,
     projection_anchor: Optional[int] = None,
-    live_bars: Optional[Tuple[np.ndarray, np.ndarray]] = None,
     hist_start: Optional[int] = None,
+    hist_stop: Optional[int] = None,
+    frozen_match: Optional[Dict[str, Any]] = None,
 ) -> go.Figure:
     """A window of real tape, then the projected path.
 
@@ -3588,15 +3974,50 @@ def build_forecast_path_figure(
     median is drawn regardless, so a missing evidence line can never cost the reader
     the aggregate answer.
 
-    **Live-tab mode: the projection is frozen, the tape rolls.**  When ``live_bars``
-    is given, the chart is in live mode: ``live_bars`` is ``(x, y)`` for the newest
-    bar(s) appended past the history, and the projection is anchored at
-    ``projection_anchor`` -- the last bar of the history *at load time* -- rather than
-    at the current tail.  The projection therefore stays at fixed x-positions on the
-    chart while the blue history tape scrolls past it, new bars added as time
-    progresses.  ``projection_anchor`` is the bar the projection grows out of;
-    ``projection_anchor + 1 + offsets`` are the projection's x-positions, computed
-    once and never moved.
+    **``frozen_match`` supplies the closest match instead of re-deriving it.**
+    It is the record :func:`_freeze_closest_match` writes: the best match's own
+    forward series, in percent from *its* anchor close, captured when the path was
+    computed.  When it is supplied, that stored series is drawn; when it is not,
+    the series is reconstructed from ``pipe.close`` exactly as it always was.
+
+    The distinction is not cosmetic.  Re-deriving slices the *current* archive at
+    ``path.starts[0]`` -- a bar *index* -- and the archive's index space is not
+    stable: as old bars age out of the front, that index names a different bar.
+    The **Live** tab's archive rolls, so a re-derived series changes underneath a
+    frozen forecast.  The other callers (the Forecast tab, the panel forecast, the
+    brushed chart) draw a *live* chart over a *live* archive and want the current
+    reading, so they keep the re-derivation and pass nothing.
+
+    **Live-tab mode: the projection is frozen, the tape rolls.**  The projection is
+    anchored at ``projection_anchor`` -- the last bar of the history *at load time*
+    -- rather than at the current tail, so it stays at fixed x-positions on the
+    chart while the blue history tape grows past it.  ``projection_anchor`` is the
+    bar the projection grows out of; ``projection_anchor + offsets`` are the
+    projection's x-positions, computed once and never moved.
+
+    **The separator stands on the first bar that belongs to the projection alone.**
+    That bar is ``projection_anchor + 1``.  Offset 0 *is* the anchor -- the bar
+    history and forecast share -- so the first bar that exists only in the
+    projection is the one after it.  The line therefore marks where the
+    projected bars *begin*, rather than pointing at the real bar they grow out
+    of.  The projection's trace still starts at the anchor, because that is the
+    contract :func:`timeseries.forecast.forecast_paths` states: the two halves
+    meet at one point rather than at two points a bar apart.
+
+    **``hist_start`` and ``hist_stop`` are the history's extent**, and they are
+    what let the *Live* tab hold still while its archive grows.  The history runs
+    from the pinned ``hist_start`` to the end of the archive, so new bars extend
+    it to the right and the left edge never moves.  ``hist_stop`` overrides that
+    end for a caller that wants a different one; it is clamped into the frame, so
+    a caller cannot ask for a span the archive does not have.
+
+    **The x-axis range is the union of the history and the projection.**  Either
+    can be the longer one -- the *Live* tab's history runs to the archive's tail
+    while its projection is a fixed number of bars past the frozen anchor, and
+    the *Forecast* tab's projection is the longer one -- and the range has to
+    cover both.  It used to be computed from the projection alone, which put the
+    history's own tail outside the visible axis: the newest bars of the tape
+    were clipped off the chart.
     """
     n = pipe.n_bars
     if history_bars is None:
@@ -3606,24 +4027,57 @@ def build_forecast_path_figure(
     if window is None:
         if projection_anchor is not None:
             hist_end = projection_anchor + 1
-            if hist_start is not None and projection_anchor == st.session_state.get("live_projection_anchor"):
-                # Frozen live mode: hist_start fixed at load time
-                hist = projection_anchor + 1 - hist_start
+            if hist_start is not None:
+                # **The history start is pinned.**  It is a bar index the caller
+                # resolved from a pinned *moment*, so it names the same bar on
+                # every pass even as the archive's indices shift underneath it.
+                #
+                # The history runs from there to the end of the archive, so the
+                # tape grows to the right as new bars arrive while the left edge
+                # stays put.  ``hist_stop`` overrides that end when the caller
+                # wants a different one.
+                if hist_stop is None:
+                    hist_stop = n
+                hist_start = max(0, min(int(hist_start), max(0, n - 1)))
+                hist_stop = max(hist_start + 1, min(int(hist_stop), n))
             else:
                 hist = max(1, min(int(history_bars), hist_end))
                 hist_start = hist_end - hist
+                hist_stop = hist_end
         else:
             hist = max(1, min(int(history_bars), n))
             hist_start = n - hist
+            hist_stop = n
     else:
         hist_start, hist_stop = int(window[0]), int(window[1])
         if not (0 <= hist_start < hist_stop <= n):
             hist_start, hist_stop = max(0, min(hist_start, n - 1)), n
-        hist = hist_stop - hist_start
-    anchor = hist_start + hist - 1
+    hist = hist_stop - hist_start
+    # **The separator is the bar the projection grows out of, and it is pinned.**
+    #
+    # It used to be derived from the *history's extent* (``hist_start + hist - 1``),
+    # which names the same bar only when the history *ends* at the projection's
+    # anchor.  The *Live* tab's history runs from a pinned start all the way to
+    # the archive's tail, so that derivation put the separator on the *newest bar
+    # of the tape*: the line slid one place to the right on every poll, with the
+    # frozen projection stranded behind it and the shaded region left inverted.
+    #
+    # The anchor therefore comes from the caller when there is one -- the caller
+    # has pinned it as a *moment* and resolved it against this pass's archive --
+    # and is derived from the history only when there is not.  That is the
+    # brushed chart, whose window *is* the history and so ends at its own
+    # anchor, and the plain reference chart, whose history is the archive's tail.
     if projection_anchor is None:
+        anchor = hist_start + hist - 1
         projection_anchor = anchor
-    stop = projection_anchor + 1 + int(path.horizon)
+    else:
+        anchor = int(projection_anchor)
+    stop = projection_anchor + int(path.horizon)
+
+    # **The separator stands on the first bar that belongs to the projection
+    # alone.**  That bar is ``anchor + 1`` -- see the docstring for why, and for
+    # why the projection's *trace* still starts on the anchor.
+    boundary = anchor + 1
 
     close = np.asarray(pipe.close, dtype=float)
     base = float(close[anchor]) if 0 <= anchor < n else float("nan")
@@ -3633,29 +4087,15 @@ def build_forecast_path_figure(
     hist_x = np.arange(hist_start, hist_start + hist, dtype=np.int64)
     hist_y = close[hist_start:hist_start + hist]
 
-    # Live mode: append the newest bar(s) to the history trace.  ``live_bars`` is
-    # ``(x, y)`` for the appended bars, computed from the live store.  The projection
-    # is anchored at load time, so the tape rolls past a frozen forecast.
-    if live_bars is not None:
-        lx, ly = live_bars
-        hist_x = np.concatenate([hist_x, np.asarray(lx, dtype=np.int64)])
-        hist_y = np.concatenate([hist_y, np.asarray(ly, dtype=float)])
-        # Extend projection x with live bar offsets (each live bar adds one offset)
-        live_offsets = np.arange(len(path.offsets), len(path.offsets) + len(lx))
-        proj_x = projection_anchor + 1 + np.concatenate([path.offsets, live_offsets])
-        # For the y values, we extend by repeating the last value of each band
-        # because the projection is frozen and we don't have new forecast values for the live bars.
-        last_q25 = base * (1 + path.q25[-1] / 100.0)
-        last_q75 = base * (1 + path.q75[-1] / 100.0)
-        last_median = base * (1 + path.median[-1] / 100.0)
-        y_q25 = np.concatenate([base * (1 + path.q25 / 100.0), np.full(len(lx), last_q25)])
-        y_q75 = np.concatenate([base * (1 + path.q75 / 100.0), np.full(len(lx), last_q75)])
-        y_median = np.concatenate([base * (1 + path.median / 100.0), np.full(len(lx), last_median)])
-    else:
-        proj_x = projection_anchor + 1 + np.asarray(path.offsets, dtype=np.int64)
-        y_q25 = base * (1 + path.q25 / 100.0)
-        y_q75 = base * (1 + path.q75 / 100.0)
-        y_median = base * (1 + path.median / 100.0)
+    # The projection's x-positions and its y-values, rebased onto the anchor's
+    # close.  The projection is frozen: these are computed from the path the
+    # caller pinned, and they never move as the archive grows.
+    # **Offset 0 is the anchor bar itself**, per
+    # :func:`timeseries.forecast.forecast_paths`.
+    proj_x = projection_anchor + np.asarray(path.offsets, dtype=np.int64)
+    y_q25 = base * (1 + path.q25 / 100.0)
+    y_q75 = base * (1 + path.q75 / 100.0)
+    y_median = base * (1 + path.median / 100.0)
 
     fig = go.Figure()
 
@@ -3665,11 +4105,16 @@ def build_forecast_path_figure(
     # Projection: base * (1 + return / 100)
     hist_y_rel = hist_y
 
+    # **The hover says *when*, not *which bar*.**  The x value is the bar index;
+    # the stamp is carried on ``customdata`` so the hover prints a date/time.
+    hist_stamps = stamp_labels(
+        pipe.bars["timestamp"].iloc[hist_start:hist_start + hist], key=pipe.timeframe)
     fig.add_trace(go.Scatter(
         x=hist_x, y=hist_y_rel, mode="lines",
         line=dict(color="#1f77b4", width=1.3),
         name="history (last %d bars)" % hist,
-        hovertemplate="%{x}<br>price %{y:.2f}<extra>history</extra>",
+        hovertemplate="%{customdata}<br>price %{y:.2f}<extra>history</extra>",
+        customdata=hist_stamps,
     ))
 
     # Band as a ``tonexty`` pair: the upper boundary is drawn first and the lower
@@ -3687,38 +4132,45 @@ def build_forecast_path_figure(
         showlegend=False, hoverinfo="skip",
         name="interquartile range",
     ))
+    # Offset labels for the projection: those bars do not exist yet, so the
+    # hover prints "+4 min" / "+4 days" rather than a clock time.
+    proj_stamps = ["+%d %s" % (o, bar_unit(o)) for o in path.offsets]
     if show_median:
         fig.add_trace(go.Scatter(
-        x=proj_x, y=y_median, mode="lines",
+            x=proj_x, y=y_median, mode="lines",
             name="median of %d matches" % path.n_matches,
-            hovertemplate="%{x}<br>price %{y:.2f}<extra>projected</extra>",
+            hovertemplate="%{customdata}<br>price %{y:.2f}<extra>projected</extra>",
+            customdata=proj_stamps,
         ))
 
         # **The single closest match, as its own line.**  The median above is an
-        # aggregate: it says what usually happened, and on its own it hides the fact that
-        # "usually" may be a compromise between windows that went opposite ways.  The
-        # best match is the one concrete instance behind the aggregate, and drawing it
-        # costs one trace and makes the median auditable -- a reader who wants to know
-        # whether the band is narrow because the evidence agreed or because the
-        # aggregation smoothed it can now see a single window it can check against the
-        # chart above.
+        # aggregate: it says what usually happened, and on its own it hides the fact
+        # that "usually" may be a compromise between windows that went opposite
+        # ways.  The best match is the one concrete instance behind the aggregate,
+        # and drawing it costs one trace and makes the median auditable.
         #
         # **Rebuilt from ``close`` rather than carried on the path**, because
-        # ``ForecastPath`` stores only the median and the quartiles: it keeps ``starts``
-        # and ``distances`` for attribution, not the individual return series.  Reconstructing
-        # it here is exact -- the same slice and the same rebasing ``forecast_paths``
-        # applies -- so the line is the real forward path of that window, not an
-        # approximation of it.
+        # ``ForecastPath`` stores only the median and the quartiles: it keeps
+        # ``starts`` and ``distances`` for attribution, not the individual return
+        # series.  Reconstructing it here is exact -- the same slice and the same
+        # rebasing ``forecast_paths`` applies.
         #
-        # **The distance is drawn, not implied.**  A single window is an anecdote, and the
-        # whole point of the §E framing is that the best-looking of thousands is extreme
-        # by construction.  Labelling it "closest match" without its distance would invite
-        # reading it as the expected outcome, which is precisely the misreading the median
-        # exists to prevent; the number is in the trace name so the reader can weigh it.
+        # **Unless the caller froze it.**  ``frozen_match`` carries the series as it
+        # was captured, for the *Live* tab, whose archive rolls: a reconstruction
+        # from the current archive would read a *different* bar and draw a different
+        # series under a frozen forecast.
         #
-        # **Drawn last and dashed**, so it sits above the band without competing with the
-        # median for attention: the median is the claim, this is the evidence for it.
-        best = _closest_match_path(pipe.close, path)
+        # **The distance is drawn, not implied.**  A single window is an anecdote,
+        # and the whole point of the §E framing is that the best-looking of
+        # thousands is extreme by construction.  Labelling it "closest match" without
+        # its distance would invite reading it as the expected outcome, which is
+        # precisely the misreading the median exists to prevent; the number is in
+        # the trace name so the reader can weigh it.
+        #
+        # **Drawn last and dashed**, so it sits above the band without competing
+        # with the median for attention: the median is the claim, this is the
+        # evidence for it.
+        best = _frozen_or_rebuilt_match(frozen_match, pipe.close, path)
         if best is not None:
             # The closest match is also rebased from percentage to absolute price.
             best_abs = base * (1 + best / 100.0)
@@ -3727,13 +4179,14 @@ def build_forecast_path_figure(
                 line=dict(color="#ff7f0e", width=1.5, dash="dot"),
                 name="closest match (distance %s)" % (
                     _closest_distance_label(path)),
-                hovertemplate="%{x}<br>price %{y:.2f}<extra>closest match</extra>",
+                hovertemplate="%{customdata}<br>price %{y:.2f}<extra>closest match</extra>",
+                customdata=proj_stamps,
             ))
     else:
         # The Live tab shows only the single closest match: with k=1 there is no
         # aggregate, so the projection is the match itself.  It is drawn unconditionally
         # (not gated on show_median) so the projection is never missing.
-        best = _closest_match_path(pipe.close, path)
+        best = _frozen_or_rebuilt_match(frozen_match, pipe.close, path)
         if best is not None:
             best_abs = base * (1 + best / 100.0)
             fig.add_trace(go.Scatter(
@@ -3741,35 +4194,66 @@ def build_forecast_path_figure(
                 line=dict(color="#ff7f0e", width=1.5, dash="dot"),
                 name="closest match (distance %s)" % (
                     _closest_distance_label(path)),
-                hovertemplate="%{x}<br>price %{y:.2f}<extra>closest match</extra>",
+                hovertemplate="%{customdata}<br>price %{y:.2f}<extra>closest match</extra>",
+                customdata=proj_stamps,
             ))
 
     # The boundary, drawn before the shading so the shading does not wash it out.
-    fig.add_vline(x=anchor, line=dict(color="rgba(128,128,128,0.9)", width=1.4,
-                                      dash="dash"))
+    #
+    # **The line is on the first *projected* bar**, ``anchor + 1``, and it is on the
+    # *pinned* anchor's successor, so it holds still as the tape rolls.  It used to
+    # be drawn at the history's last bar, which on the *Live* tab is the archive's
+    # newest bar -- so the line walked right with the tape and stopped meaning
+    # anything.
+    fig.add_vline(x=boundary, line=dict(color="rgba(128,128,128,0.9)", width=1.4,
+                                        dash="dash"))
+    # **The shading covers the projection, and only the projection.**  It runs
+    # from the first projected bar to the projection's last bar, and is clamped
+    # so it can never be inverted: on the *Live* tab the tape runs *past* the
+    # anchor, so the history's tail lies to the right of the line, and an
+    # unclamped rectangle would have been drawn backwards over it.
     fig.add_vrect(
-        x0=anchor, x1=stop - 0.5,
+        x0=boundary, x1=max(float(stop) - 0.5, float(boundary)),
         fillcolor="rgba(128,128,128,0.10)", line_width=0, layer="below",
     )
 
     # Ticks: real timestamps across the history, projected offsets across the future.
-    # In live mode ``hist_x`` includes appended bars past the pipeline's length, so the
-    # tick indices must be split: history ticks stay inside ``pipe.bars``, appended bars
-    # get their own labels from ``live_x``, and the projection keeps offset labels.
-    hist_n = len(hist_x)
-    live_x, live_y = live_bars if live_bars is not None else (np.array([], dtype=np.int64), np.array([], dtype=float))
-    live_n = len(live_x)
-    hist_only = hist_n - live_n
-    step = max(1, hist_only // 8)
-    ticks = list(range(hist_start, hist_start + hist_only, step))
-    if not ticks or ticks[-1] != hist_start + hist_only - 1:
-        ticks.append(hist_start + hist_only - 1)
+    # The history ticks stay inside ``pipe.bars`` -- every one of them is a real
+    # bar of the archive -- and the projection keeps offset labels.
+    step = max(1, hist // 8)
+    ticks = list(range(hist_start, hist_start + hist, step))
+    if not ticks or ticks[-1] != hist_start + hist - 1:
+        ticks.append(hist_start + hist - 1)
     pstep = max(1, int(path.horizon) // 5)
     proj_ticks = list(range(0, int(path.horizon) + 1, pstep))
     if proj_ticks and proj_ticks[-1] != int(path.horizon):
         proj_ticks.append(int(path.horizon))
 
-    tickvals = ticks + [projection_anchor + 1 + o for o in proj_ticks]
+    # **The anchor is labelled exactly once, by whichever side owns it.**  It is
+    # the history's last bar on the *Projection* tab (the history ends there),
+    # but on the *Live* tab the history runs past it to the archive's tail, so
+    # the anchor sits *inside* the history and is not necessarily one of the
+    # history's own ticks.  So the history's label is used when the history
+    # carries the anchor, and the anchor is added as an explicit tick when it
+    # does not.  Either way the boundary is named once, and never twice.
+    anchor_tick = projection_anchor
+    history_labels_anchor = anchor_tick in ticks
+    # **Offset 0 is dropped either way.**  It sits on the anchor bar, which is
+    # always labelled -- by the history's own ticks when the history ends at
+    # the anchor, and by an explicit tick when the anchor sits *inside* a
+    # history that runs on past it (the *Live* tab, whose tape keeps rolling to
+    # the right of the frozen anchor).  Keeping offset 0 in the second case
+    # put the anchor on the axis twice, under two different spellings: the
+    # history's full timestamp and the projection's bare clock time.
+    proj_offsets = [o for o in proj_ticks if o != 0]
+    # **Offset 1 is the boundary, and the boundary is always labelled.**  The
+    # tick step can skip over it -- a horizon of 20 with a step of 4 goes
+    # 0, 4, 8 ... and never names the bar the separator stands on -- so offset
+    # 1 is put back in.  An unlabelled separator is a boundary the reader
+    # cannot place, and this one is the whole point of the chart.
+    if int(path.horizon) >= 1 and 1 not in proj_offsets:
+        proj_offsets = sorted(proj_offsets + [1])
+
     # **The unit is the resolution's, not a literal.**  These offsets are *bars*, so
     # on daily a tick reads "+4 days", not "+4 min" -- one bar is one trading day there.
     # Labelling them in minutes was a wrong number printed straight onto a chart, which
@@ -3783,39 +4267,68 @@ def build_forecast_path_figure(
     # was handed, not the ones the page opened on.  The *history* labels therefore come
     # from the pipeline, which is the authority on the bars actually drawn; only the
     # projected offsets, which have no pipeline behind them, use the active timeframe.
-    # Live mode: the appended bars carry their own timestamps.
-    if live_bars is not None:
-        live_x, live_y = live_bars
-        # Get the timestamp of the most recent bar in the pipeline for live bars.
-        # The appended bar's data comes from the pipeline's last bar, so its label
-        # is the most recent timestamp even though its x-position is n (past the
-        # pipeline's current length).
-        most_recent_ts = pipe.bars["timestamp"].iloc[-1]
-        live_ts = [
-            stamp_label(most_recent_ts, key=pipe.timeframe) for _ in live_x
-        ]
-        hist_ts = [
-            stamp_label(pipe.bars["timestamp"].iloc[i], key=pipe.timeframe) for i in ticks
-        ]
-        anchor_ts = pd.Timestamp(pipe.bars["timestamp"].iloc[projection_anchor])
-        tickvals = ticks + list(live_x) + [projection_anchor + 1 + o for o in proj_ticks]
-        ticktext = hist_ts + live_ts + _proj_ticktext(anchor_ts, proj_ticks)
-    else:
-        anchor_ts = pd.Timestamp(pipe.bars["timestamp"].iloc[projection_anchor])
-        ticktext = [
-            stamp_label(pipe.bars["timestamp"].iloc[i], key=pipe.timeframe) for i in ticks
-        ] + _proj_ticktext(anchor_ts, proj_ticks)
+    anchor_ts = pd.Timestamp(pipe.bars["timestamp"].iloc[projection_anchor])
+
+    # **The tick values and their labels are built together**, so the two lists
+    # cannot drift apart: a label is only ever emitted for a position that was
+    # actually added.
+    tickvals: List[int] = []
+    ticktext: List[str] = []
+    taken = set()
+
+    def _add_tick(value: int, label: str) -> None:
+        if value in taken:
+            return
+        taken.add(value)
+        tickvals.append(value)
+        ticktext.append(label)
+
+    for i in ticks:
+        _add_tick(i, stamp_label(pipe.bars["timestamp"].iloc[i], key=pipe.timeframe))
+    if not history_labels_anchor:
+        # The boundary, named by the history's own label so both halves of the
+        # axis agree on what a bar looks like.
+        _add_tick(anchor_tick, stamp_label(anchor_ts, key=pipe.timeframe))
+    for o, label in zip(proj_offsets, _proj_ticktext(anchor_ts, proj_offsets)):
+        # **A projected tick that lands on a position the history already has
+        # is dropped.**  Both sides label the same x-position, so keeping both
+        # would print two labels on one bar -- the same mistake as the anchor's,
+        # arrived at from the other direction.
+        _add_tick(projection_anchor + o, label)
+
+    # **The ticks are sorted left to right.**  The anchor and the projection's
+    # offsets are appended after the history's own ticks, but on the *Live* tab
+    # the anchor sits *inside* the history, so the unsorted list put the
+    # projection's ticks in the middle of the axis and the history's after
+    # them.  The positions are the same either way -- this only decides the
+    # order they are listed in, and a reader of the labels should meet them
+    # in the order they appear on the chart.
+    order = sorted(range(len(tickvals)), key=lambda k: tickvals[k])
+    tickvals = [tickvals[k] for k in order]
+    ticktext = [ticktext[k] for k in order]
 
     # No zero-line for absolute price.
-    # Live mode: the x-range must extend past the appended bars to include the full
-    # frozen projection (which sits at ``projection_anchor + 1 + offsets``, beyond the tape).
-    live_stop = hist_start + len(hist_x) if live_bars is not None else stop
-    x_range = [hist_start - 0.5, max(live_stop, stop) - 0.5]
-    xaxis_title = "bar index · sessions compressed · right of the dashed line is projected"
-    if live_bars is not None:
-        xaxis_title = (
-            "bar index · sessions compressed · right of the dashed line is frozen projection"
-        )
+    #
+    # **The range must cover the history *and* the projection.**  The history can
+    # be longer than the projection -- that is the normal case for the *Live*
+    # tab, whose history runs to the end of the archive while the projection is
+    # a fixed number of bars past the frozen anchor -- so the range is the
+    # *union* of the two extents.
+    #
+    # It used to be computed from the projection alone, which meant the
+    # history's own tail was drawn *outside* the visible axis: the newest bars
+    # of the tape were clipped off the chart.  The appended-bar mechanism had
+    # been hiding this, because it drew a synthetic point rather than the
+    # archive's real tail.
+    hist_stop_x = hist_start + len(hist_x)
+    x_range = [hist_start - 0.5, max(hist_stop_x, stop) - 0.5]
+    # **The axis title describes the separator, not a side of it.**  It used to
+    # say "right of the dashed line is projected", which is only true where the
+    # history *ends* at the line -- the *Projection* and *Forecast* tabs.  On
+    # the *Live* tab the tape keeps rolling to the right of the frozen anchor,
+    # so the projected bars are *on* the right of the line but the tape is too,
+    # and the old wording described a half of the chart that is not there.
+    xaxis_title = "bar index · sessions compressed · the dashed line is where the projection starts"
     fig.update_layout(
         height=height,
         margin=dict(l=64, r=8, t=46, b=54),
@@ -3827,6 +4340,21 @@ def build_forecast_path_figure(
             showgrid=True, gridcolor="rgba(128,128,128,0.15)", automargin=True,
             tickmode="array", tickvals=tickvals, ticktext=ticktext,
             range=x_range,
+            # **The unified hover box's *title* is what printed the bar number.**
+            #
+            # With ``hovermode="x unified"`` the box has two parts: a title, which
+            # plotly.js fills with the hovered x value, and one entry per trace,
+            # which the trace's own ``hovertemplate`` fills.  The traces carry the
+            # bar's stamp on ``customdata``, so the entries already print the
+            # date/time -- but the title above them still read the bar index, and
+            # that was the more prominent of the two.
+            #
+            # The title is a template of its own and cannot see ``customdata``, so
+            # it cannot be told to print the stamp.  ``%{xother}`` resolves to the
+            # empty string on a chart where every trace shares one x axis, so the
+            # title renders as nothing and the box collapses to its trace entries
+            # -- which carry the date/time.
+            unifiedhovertitle=dict(text="%{xother}"),
         ),
         yaxis=dict(
             title="price",
@@ -4046,12 +4574,12 @@ def _render_best_match_pair(pipe: Pipeline, query: M.Query, m: M.Match, rank: in
         render_clamped_pan_chart(m_fig, height=height,
                                  key="mchart_%s_%d" % (scope, rank))
     else:
+        # No ``scroll_zoom`` even when pannable: zoom is off across the app, and a
+        # wheel gesture that rescaled this chart would break the equal-bar-count
+        # comparison with the query chart above it without the reader asking for it.
         st.plotly_chart(
             m_fig,
             width='stretch', key="mchart_%s_%d" % (scope, rank),
-            # No ``scroll_zoom`` even when pannable: zoom is off across the app, and a
-            # wheel gesture that rescaled this chart would break the equal-bar-count
-            # comparison with the query chart above it without the reader asking for it.
             config=chart_config(),
         )
 
@@ -4132,7 +4660,8 @@ def _render_search_controls(scope: str) -> Dict[str, Any]:
     }
 
 
-def render_live_tab(pipe: Pipeline, symbol: str) -> None:
+def render_live_tab(pipe: Pipeline, symbol: str, *,
+                    amplitude_weight: float = M.DEFAULT_AMPLITUDE_WEIGHT) -> None:
     """The **Live** tab: "Where this usually goes next" for 1-minute data.
 
     This tab identifies historical patterns matching recent price action
@@ -4140,11 +4669,33 @@ def render_live_tab(pipe: Pipeline, symbol: str) -> None:
     for 1-minute resolution data.
 
     **The tape rolls; the projection is frozen.**  On the first render the app
-    matches the most recent ``recent_bars`` and projects the single closest match.
+    matches the ``recent_bars`` on screen and projects the single closest match.
     That projection is anchored at load time and never changes.  On every poll
-    (triggered by ``st.fragment`` every 60 seconds) the newest bar is appended
-    to the history trace, so the blue tape scrolls past the frozen orange
-    projection as time progresses.  Existing bars are never changed.
+    (triggered by ``st.fragment`` every 60 seconds) the refreshed archive is
+    drawn from the *same* pinned starting bar, so the blue tape grows to the
+    right while the orange projection stays exactly where it was.  Existing bars
+    are never changed.
+
+    **Four things have to be pinned, and each one is pinned as a *moment* or a
+    *value* rather than as a bar index** -- the archive's index space is not
+    stable, so a stored index names a different bar once old bars age out:
+
+    * **The history's start bar**, as a moment -- see :func:`live_pinned_anchor`.
+    * **The projection itself**, frozen as a value computed once against the
+      pinned window.  Recomputing it each poll re-aimed the query at the moving
+      tail, so the "frozen" projection was a *different forecast every time*.
+    * **The history's end bar**, drawn from the refreshed archive so the newest
+      bars are on the chart.
+    * **The closest match** -- the orange trace -- frozen alongside the path.
+      It was re-derived each poll by slicing the *current* archive at
+      ``path.starts[0]``, a bar index, so it changed underneath a frozen
+      forecast.  A path and a series derived from *different* archives are not
+      the same forecast, so the two are written and read together.
+
+    The tab's promise is that the reader can watch what the tape did against
+    what was predicted for it.  Each of those four was breaking that promise
+    in a different way, and none of them announced itself: the chart simply
+    looked wrong in a way that was hard to name.
     """
     # Requirement 1: Resolution Check & Guardrails
     if _tf().key != "1m":
@@ -4157,7 +4708,7 @@ def render_live_tab(pipe: Pipeline, symbol: str) -> None:
     recent_bars = st.slider(
         "Recent bars",
         min_value=10, max_value=600,
-        step=10, value=10,
+        step=50, value=10,
         help="How many of the most recent bars to use as the pattern to match.",
         key="live_recent_bars_slider",
     )
@@ -4165,27 +4716,23 @@ def render_live_tab(pipe: Pipeline, symbol: str) -> None:
     projection_bars = st.slider(
         "Projection bars",
         min_value=10, max_value=600,
-        step=10, value=10,
+        step=50, value=10,
         help="How many bars into the future to project the historical match.",
         key="live_projection_bars_slider",
     )
 
     # Requirement 3: Analysis Logic (Backend) — fragment runs every 60s
-    # and rebuilds ``pipe`` from Yahoo; the projection is computed inside the
-    # fragment so it always uses the refreshed pipeline.
-    # The frozen anchor is stored in session_state so it survives across
-    # fragment reruns and never changes after initial load.
-    if "live_projection_anchor" not in st.session_state:
-        # First render: capture the anchor at load time.
-        n0 = pipe.n_bars
-        st.session_state.live_projection_anchor = n0 - 1
-        # Also compute and fix the initial history start position
-        # This ensures the history window stays fixed when history_bars slider changes
-        initial_history_bars = 10  # matches the slider's default value
-        hist_end = st.session_state.live_projection_anchor + 1
-        hist = max(1, min(initial_history_bars, hist_end))
-        st.session_state.live_hist_start = hist_end - hist
-    projection_anchor = st.session_state.live_projection_anchor
+    # and rebuilds ``pipe`` from Yahoo.
+    #
+    # **The anchor and the history start are pinned as *moments*, not as bar
+    # indices.**  See :func:`live_pinned_anchor` for why an index cannot work
+    # here: the archive's bar indices shift every time the frame is rebuilt, so
+    # a stored index names a different bar on the next poll.  The two pinned
+    # moments are the *anchor* -- the last bar the projection grows out of --
+    # and the *history start* -- the first bar on screen.  Both are resolved
+    # against the refreshed pipeline on every pass, so the chart holds still
+    # while the tape grows underneath it.
+    anchor_ts, hist_start_ts = live_pinned_anchor(pipe, symbol, recent_bars)
 
     @st.fragment(run_every=60)
     def _live_poll_fragment() -> None:
@@ -4193,13 +4740,13 @@ def render_live_tab(pipe: Pipeline, symbol: str) -> None:
         # Without refresh=True the cache never hits and the archive stays
         # frozen at load time (see test_fetch_store_survives_a_rerun).
         nonlocal pipe  # type: ignore - reassignment in nested scope
-        # projection_anchor is frozen at load time in session_state; read it once
-        # and never update it inside the fragment. This keeps the separator fixed
-        # while the tape rolls forward.
-        projection_anchor = st.session_state.live_projection_anchor
         try:
             new_bars = fetch_ticker_cached(symbol, refresh=True, timeframe=_tf().key)
-            # Rebuild the pipeline from the refreshed frame.
+            # Rebuild the pipeline from the refreshed frame.  **The package's
+            # uncached ``pipeline_from_frame``, not the cached wrapper defined
+            # above** -- a poll exists to pick up bars the cache does not have, so
+            # routing it through the cache would serve the very frame the refresh
+            # just replaced.
             from timeseries.pipeline import pipeline_from_frame
             pipe = pipeline_from_frame(
                 "{}@{}".format(symbol, _tf().key),
@@ -4210,46 +4757,477 @@ def render_live_tab(pipe: Pipeline, symbol: str) -> None:
         except Exception as exc:  # noqa: BLE001 - surface any loader failure in the UI
             st.error("Could not refresh live data: {}".format(exc))
 
-        # Append the newest bar if the tape has advanced since the last rerun.
-        # This is the "every minute" update: the browser poller fires a rerun,
-        # this checks the pipeline's last timestamp against the last one we drew,
-        # and if newer it extends the history trace by one bar.
-        # Idempotent -- rerunning while the same bar is newest is a no-op.
-        live_bars = live_append_new_bar(pipe, symbol, recent_bars=recent_bars)
+        # **The pinned moments are resolved against the *refreshed* pipeline.**
+        # They are moments, so this is the same bar every time -- but the
+        # index it lands on is not, which is exactly why the moment is what
+        # was stored.  A pin that has aged out of the archive is reported
+        # rather than silently re-anchored on a different bar.
+        projection_anchor = resolve_bar_index(pipe, anchor_ts)
+        hist_start = resolve_bar_index(pipe, hist_start_ts)
+        if projection_anchor is None or hist_start is None:
+            st.warning("The pinned starting bar is no longer in the archive.")
+            return
 
-        # Recompute the path with the refreshed pipe and the frozen anchor.
-        # The frozen anchor must stay inside the refreshed pipeline; if the
-        # tape shrank (e.g. shorter fetch) clamp to the new tail.
-        safe_anchor = min(projection_anchor, max(0, pipe.n_bars - 1))
-        path = forecast_path_for(
-            cache_key=f"live_{symbol}_{recent_bars}_{projection_bars}",
-            pipe=pipe,
-            length=recent_bars,
-            horizon=projection_bars,
-            k=1,
-            amplitude_weight=M.DEFAULT_AMPLITUDE_WEIGHT,
-            window=None,
-        )
+        # **The projection is frozen: computed once, then reused.**  It is computed
+        # against the *pinned* window -- the bars the reader is actually looking at --
+        # and stored whole, so every poll draws the same forecast.  See the
+        # docstring for why recomputing it each poll defeated the whole tab.
+        #
+        # **The closest match is frozen with it, because the path alone was not
+        # enough**, and the two are written and read together: a path and a series
+        # derived from *different* archives are not the same forecast, and drawing
+        # one next to the other would be a chart of nothing in particular.
+        path_key = live_state_key(symbol, LIVE_PATH_KEY)
+        match_key = live_state_key(symbol, LIVE_MATCH_KEY)
+        path = st.session_state.get(path_key)
+        frozen_match = st.session_state.get(match_key)
+        if (path is None
+                or _live_path_is_stale(path, recent_bars, projection_bars)
+                or not _frozen_match_is_usable(frozen_match, path)):
+            path = forecast_path_for(
+                cache_key=f"live_{symbol}_{recent_bars}_{projection_bars}",
+                pipe=pipe,
+                length=recent_bars,
+                horizon=projection_bars,
+                k=1,
+                amplitude_weight=M.DEFAULT_AMPLITUDE_WEIGHT,
+                window=(hist_start, projection_anchor + 1),
+            )
+            if path is not None:
+                # **The series is captured from the *same* archive the path was
+                # computed from**, so the two agree by construction.  It is
+                # captured here rather than on a later poll because the later
+                # poll's archive is a *different* archive -- which is the whole
+                # problem being fixed.
+                st.session_state[path_key] = path
+                st.session_state[match_key] = _freeze_closest_match(pipe.close, path)
+            else:
+                # A path that could not be computed must not leave a stale
+                # series behind: the pair is replaced together or not at all.
+                st.session_state.pop(path_key, None)
+                st.session_state.pop(match_key, None)
+            # Read the pair back, so the figure is given exactly what was
+            # stored -- including after a recompute, where the local name
+            # still held the *previous* pair.
+            path = st.session_state.get(path_key)
+            frozen_match = st.session_state.get(match_key)
 
         if path is None:
             st.warning("Could not find a matching historical pattern for the current price action.")
             return
 
-        # Build the figure with the refreshed pipeline and live bars.
+        # Build the figure with the refreshed pipeline.
+        #
+        # **The history runs from the pinned start to the end of the archive**,
+        # so the tape grows to the right as new bars arrive while the left
+        # edge stays on the pinned bar.  The bars are drawn straight from the
+        # refreshed pipeline: the old appended-bar mechanism drew a synthetic
+        # point past the archive's last index, which put the newest bar
+        # outside the axis range -- off the chart entirely -- and its x-position
+        # moved further out on every poll.
+        #
+        # **The frozen series is handed over with the path**, so the orange
+        # trace is drawn as it was captured rather than re-read from the
+        # archive that has since rolled.
         fig = build_forecast_path_figure(
             pipe,
             path,
             history_bars=recent_bars,
             title=f"Live Projection for {symbol}",
             show_median=False,
-            projection_anchor=safe_anchor,
-            live_bars=live_bars,
-            hist_start=st.session_state.get("live_hist_start"),
+            projection_anchor=projection_anchor,
+            hist_start=hist_start,
+            hist_stop=pipe.n_bars,
+            frozen_match=frozen_match,
         )
 
         st.plotly_chart(fig, width='stretch')
 
+        # Progression content, shown under the Live chart.
+        st.subheader("Progression")
+
+        if pipe is None or not pipe.ready:
+            st.info("Progression is unavailable until the pipeline is ready.")
+            return
+
+        n_bars = pipe.n_bars
+        lengths = progression_lengths(n_bars)
+        if not lengths:
+            st.info("This archive is too short to sweep any lookback length.")
+            return
+
+        hint(
+            "Each trace asks the same question about the <b>same moment</b> at a "
+            "different lookback: the archive's most recent <i>L</i> bars are matched "
+            "against its own history, and the matched windows' forward paths are "
+            "plotted. Pale traces are short lookbacks, dark ones long. The red line is "
+            "the median across all of them — where the traces spread wide, the "
+            "lookbacks disagree, and that is the finding."
+        )
+
+        with st.spinner("Matching {} lookback lengths and projecting…".format(len(lengths))):
+            sweep = progression_sweep_for(
+                "{}@{}|prog|{}|{}|{}|{}".format(
+                    symbol, pipe.timeframe, PROGRESSION_HORIZON, PROGRESSION_MATCHES,
+                    amplitude_weight, progression_length_step(),
+                ),
+                pipe,
+                horizon=int(PROGRESSION_HORIZON),
+                k=int(PROGRESSION_MATCHES),
+                amplitude_weight=float(amplitude_weight),
+                step=progression_length_step(),
+            )
+
+        if sweep is None or not sweep.answered:
+            st.warning(
+                "No projection could be built for any lookback length on this archive."
+            )
+            hint(
+                "Matching needs at least a window's worth of bars after cleaning, and "
+                "every lookback here needs enough history *behind* it to compare "
+                "against. **What to try:** check the <b>Quality</b> tab for how many "
+                "bars loaded, or use a more liquid symbol, which returns more of the "
+                "available intraday history."
+            )
+            return
+
+        fig = build_progression_figure(
+            pipe, sweep,
+            history_bars=min(500, n_bars),
+            title="%s · %d lookbacks from %d to %d bars · %d bars projected"
+                  % (symbol, len(sweep.answered), lengths[0], lengths[-1], PROGRESSION_HORIZON),
+        )
+        st.plotly_chart(fig, width='stretch', key="progression_paths",
+                        config=chart_config())
+
+        hint(
+            "The dashed line is where the <b>projection</b> starts. To its left is the "
+            "real tape — the archive's most recent bars, rebased to the last close so "
+            "it meets the projections at zero. To its right is what the matched "
+            "windows did over the following {} bars, each rebased to its own final "
+            "close.".format(PROGRESSION_HORIZON)
+        )
+
+        _render_progression_table(sweep, PROGRESSION_HORIZON)
+
+        failed = sweep.failed
+        if failed:
+            st.warning(
+                "{} of {} lookback lengths could not be projected.".format(
+                    len(failed), len(sweep.paths))
+            )
+            hint(
+                "A length fails when the archive is too short to hold it, or when no "
+                "historical window matches it closely enough to project. The lengths "
+                "that did answer are all drawn above; the failed ones are listed in the "
+                "table with the reason."
+            )
     _live_poll_fragment()
+
+
+# --------------------------------------------------------------------------- #
+# Progression constants (content now shown under the Live chart)
+# --------------------------------------------------------------------------- #
+#: How many matches each lookback length asks for.
+#:
+#: 30 is :data:`FORECAST_PATH_MATCHES` -- the same number the Forecast tab's path
+#: chart uses -- so the two tabs are drawing comparable evidence and the §E minimum
+#: is met by every length.  It is *not* :data:`timeseries.pipeline.DEFAULT_K` (50):
+#: that is the matcher's own default for a plain search, and this sweep runs fifty
+#: searches, so fifty matches each would be fifty times the work for a median that
+#: barely moves.
+PROGRESSION_MATCHES = 30
+
+#: The step between lookback lengths, in bars.
+#:
+#: 10 gives the fifty lengths the request asked for -- 10 through 500 -- and is the
+#: natural grid on 1-minute data, where ten bars is a tenth of an hour.  The lengths
+#: are the *only* thing this tab sweeps, so the step is a statement about resolution
+#: and is namespaced by it below.
+PROGRESSION_LENGTH_STEP = 50
+
+#: The forward horizon the sweep projects over, in bars.
+#:
+#: 300 is what the request asked for, and it is the number the chart's right-hand
+#: side is sized against.  It is deliberately *not* read from the Projection tab's
+#: *Projection bars* slider: that slider governs a different chart, and letting it
+#: silently resize this one would mean two tabs' horizons could disagree while
+#: looking like the same control.
+PROGRESSION_HORIZON = 300
+
+
+def progression_length_step() -> int:
+    """The lookback step for the active resolution, in bars.
+
+    Ten bars on 1-minute data is a tenth of an hour -- a natural unit of "recent".
+    On daily data it is a fortnight and change, which is too coarse to show how the
+    answer changes with the lookback, so the daily step is five bars.
+    """
+    return 5 if _tf().bars_per_session == 1 else PROGRESSION_LENGTH_STEP
+
+
+def progression_lengths(n_bars: int) -> List[int]:
+    """The lookback lengths to sweep for an archive of ``n_bars`` bars.
+
+    The requested range -- 10 through 500 -- is swept in full on every resolution.
+    It is **not** truncated to the archive's own length, because the sweep's whole
+    point is to show how the answer changes with the lookback: a truncated sweep on a
+    short archive would answer a different question than the same sweep on a long
+    one, and the reader would have no way of knowing the range moved.
+    """
+    return default_lengths(
+        n_bars,
+        step=progression_length_step(),
+        max_length=MAX_PROGRESSION_LENGTH,
+        min_length=10,
+    )
+
+
+@st.cache_resource(show_spinner=False, max_entries=4)
+def progression_sweep_for(
+    cache_key: str,
+    pipe: Pipeline,
+    *,
+    horizon: int,
+    k: int,
+    amplitude_weight: float,
+    step: int,
+) -> Optional[ProgressionSweep]:
+    """The whole sweep, cached.
+
+    Cached exactly as :func:`forecast_path_for` is, and for the same reason: the
+    ``cache_key`` string names the question while the ``Pipeline`` rides along as
+    un-keyed payload, so Streamlit does not hash a multi-thousand-row frame on every
+    rerun.  The key covers everything that changes the answer -- the horizon, the
+    match count, the amplitude weight and the length step -- so a nudge to an
+    unrelated sidebar control does not re-run fifty searches, while a change to any
+    of these does.
+
+    Fifty searches is roughly three seconds of matcher time, so the cache is the
+    difference between a tab that responds and a tab that stalls on every pass.
+    """
+    lengths = progression_lengths(pipe.n_bars)
+    if not lengths:
+        return None
+    try:
+        return progression_paths(
+            pipe,
+            lengths=lengths,
+            horizon=int(horizon),
+            k=int(k),
+            amplitude_weight=float(amplitude_weight),
+        )
+    except Exception:  # noqa: BLE001 - a failed sweep is a missing chart, not a dead page
+        return None
+
+
+def build_progression_figure(
+    pipe: Pipeline,
+    sweep: ProgressionSweep,
+    *,
+    history_bars: int = 500,
+    title: Optional[str] = None,
+) -> go.Figure:
+    """The Progression chart: the recent tape, then every lookback's projection.
+
+    **One chart, many projections.**  The fifty traces are the sweep's answer read
+    at once, and the reason they can share an axis is that they are all in
+    **percent from the anchor bar** -- the close of the archive's most recent bar.
+    A projection that started from a different price level would not be comparable
+    with the others, and fifty such traces on one axis would be unreadable.
+
+    **Traces are coloured by lookback length, on a sequential ramp.**  Short
+    lookbacks are light and long ones are dark, so the ramp carries meaning rather
+    than just separating the lines: a reader can see at a glance whether the
+    *long* lookbacks (the dark, top-right of the ramp) agree with the short ones
+    (the pale ones), and that comparison is the tab's whole purpose.  The ramp runs
+    dark-to-light across the viridis scale, which is monotonic in lightness and
+    therefore readable in greyscale and for the most common colour-vision
+    deficiencies.
+
+    **The consensus line is drawn on top, in the app's own blue.**  Fifty
+    overlapping traces cannot be read by eye, so the median across the lengths is
+    computed and drawn: what the lookbacks *agree* on.  Where they disagree, the
+    cloud is wide and the consensus sits somewhere inside it -- and that disagreement
+    is the finding, not a failure of the chart.
+
+    **The history is drawn in the same percent units**, rebased to the anchor, so
+    the real tape and the projections meet at one visible bar at exactly zero.
+    Drawing price against percent would be the mixed-units mistake the app's other
+    charts are careful to avoid.
+
+    The boundary line stands on the first bar that belongs to the projection alone
+    -- the bar after the anchor -- matching :func:`build_forecast_path_figure`'s
+    convention, so a reader moving between the two charts finds the same line in
+    the same place.
+    """
+    n = pipe.n_bars
+    horizon = int(sweep.horizon)
+    anchor = n - 1
+
+    close = np.asarray(pipe.close, dtype=float)
+    base = float(close[anchor]) if 0 <= anchor < n else float("nan")
+    if not np.isfinite(base) or base <= 0:
+        base = 1.0
+
+    fig = go.Figure()
+
+    # **The history: the archive's own last ``history_bars`` bars, in percent.**
+    hist = max(1, min(int(history_bars), n))
+    hist_start = n - hist
+    hist_x = np.arange(hist_start, n, dtype=np.int64)
+    hist_y = (close[hist_start:n] / base - 1.0) * 100.0
+    hist_stamps = stamp_labels(
+        pipe.bars["timestamp"].iloc[hist_start:n], key=pipe.timeframe)
+    fig.add_trace(go.Scatter(
+        x=hist_x, y=hist_y, mode="lines",
+        line=dict(color="#1f77b4", width=1.3),
+        name="recent tape (last %d bars)" % hist,
+        hovertemplate="%{customdata}<br>%{y:.2f}%<extra>recent tape</extra>",
+        customdata=hist_stamps,
+    ))
+
+    # **The projections, coloured by lookback length.**
+    #
+    # The colour is assigned by the length's *position in the sweep*, not by its
+    # value, so the ramp is monotonic in the order the lengths were asked for --
+    # 10 is always the palest and 500 always the darkest, whatever lengths in
+    # between failed to answer.
+    answered = sweep.answered
+    if answered:
+        ordered = sweep.paths
+        n_paths = max(1, len(ordered) - 1)
+        ramp = px.colors.sample_colorscale(
+            "Viridis",
+            [i / n_paths for i in range(len(ordered))],
+        )
+        colour_of = {}
+        for i, p in enumerate(ordered):
+            colour_of[id(p)] = ramp[i]
+
+        offsets = np.arange(horizon + 1, dtype=np.int64)
+        proj_x = anchor + offsets
+        # Offset labels for the projection: those bars do not exist yet, so the
+        # hover prints "+4 min" / "+4 days" rather than a clock time.
+        proj_stamps = ["+%d %s" % (int(o), bar_unit(int(o))) for o in offsets]
+
+        for p in ordered:
+            if p.path is None:
+                continue
+            colour = colour_of[id(p)]
+            fig.add_trace(go.Scatter(
+                x=proj_x,
+                y=np.asarray(p.path.median, dtype=float),
+                mode="lines",
+                line=dict(color=colour, width=1.1),
+                opacity=0.75,
+                name="%d-bar lookback" % p.length,
+                legendgroup="lookback_%d" % p.length,
+                showlegend=False,
+                # Concatenated rather than ``%``-formatted: the template is full of
+                # ``%{...}`` plotly placeholders, and ``%``-formatting reads the
+                # ``%{`` as a format specifier and raises.
+                hovertemplate="%{customdata}<br>%{y:.2f}%<extra>" + "%d-bar lookback</extra>"
+                              % p.length,
+                customdata=proj_stamps,
+            ))
+
+        # **The consensus across the lengths, drawn last so it sits on top.**
+        consensus = sweep.consensus
+        if np.isfinite(consensus).any():
+            fig.add_trace(go.Scatter(
+                x=proj_x,
+                y=np.asarray(consensus, dtype=float),
+                mode="lines",
+                line=dict(color="#d62728", width=2.4),
+                name="median across all %d lookbacks" % len(answered),
+                hovertemplate="%{customdata}<br>%{y:.2f}%<extra>consensus</extra>",
+                customdata=proj_stamps,
+            ))
+
+    # **The boundary, on the first bar that belongs to the projection alone.**
+    boundary = anchor + 1
+    fig.add_vline(x=boundary, line=dict(color="rgba(128,128,128,0.9)", width=1.4,
+                                        dash="dash"))
+    fig.add_vrect(
+        x0=boundary, x1=float(anchor + horizon),
+        fillcolor="rgba(128,128,128,0.10)", line_width=0, layer="below",
+    )
+
+    # **Ticks: real stamps across the history, offsets across the projection.**
+    tickvals: List[int] = []
+    ticktext: List[str] = []
+    taken = set()
+
+    def _add_tick(value: int, label: str) -> None:
+        if value in taken:
+            return
+        taken.add(value)
+        tickvals.append(value)
+        ticktext.append(label)
+
+    step = max(1, hist // 8)
+    hist_ticks = list(range(hist_start, n, step))
+    if not hist_ticks or hist_ticks[-1] != n - 1:
+        hist_ticks.append(n - 1)
+    for i in hist_ticks:
+        _add_tick(i, stamp_label(pipe.bars["timestamp"].iloc[i], key=pipe.timeframe))
+
+    anchor_ts = pd.Timestamp(pipe.bars["timestamp"].iloc[anchor])
+    pstep = max(1, horizon // 5)
+    proj_ticks = [o for o in range(0, horizon + 1, pstep) if o != 0]
+    if horizon >= 1 and 1 not in proj_ticks:
+        proj_ticks = sorted(proj_ticks + [1])
+    for o, label in zip(proj_ticks, _proj_ticktext(anchor_ts, proj_ticks)):
+        _add_tick(anchor + o, label)
+
+    order = sorted(range(len(tickvals)), key=lambda k: tickvals[k])
+    tickvals = [tickvals[k] for k in order]
+    ticktext = [ticktext[k] for k in order]
+
+    fig.update_layout(
+        height=520,
+        margin=dict(l=8, r=8, t=48, b=8),
+        hovermode="x unified",
+        title=dict(text=title or "Progression", font=dict(size=13)),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        xaxis=dict(
+            title_text="bar",
+            tickmode="array",
+            tickvals=tickvals,
+            ticktext=ticktext,
+            range=[hist_start - 1, anchor + horizon + 1],
+        ),
+        yaxis=dict(title_text="percent from the last close"),
+    )
+    return fig
+
+
+def _render_progression_table(sweep: ProgressionSweep, horizon: int) -> None:
+    """The per-length evidence table, under the chart.
+
+    Every number the chart draws is here in text, because a chart of fifty
+    overlapping traces cannot be read to the precision a table gives.  The columns
+    are the ones that decide whether a length's answer can be trusted: how many
+    windows it is built from, how far behind the best one sat in the archive's
+    own ranking (§E), and how large the match pool was.
+    """
+    rows = []
+    for p in sweep.paths:
+        rows.append({
+            "Lookback": "%d bars" % p.length,
+            "Matches": p.n_matches if p.ok else 0,
+            "Best distance": ("%.3f" % p.distance) if np.isfinite(p.distance) else "—",
+            "Percentile": ("%.2f%%" % (100.0 * p.percentile)
+                           if np.isfinite(p.percentile) else "—"),
+            "Pool": p.n_candidates if p.n_candidates else "—",
+            "Status": (p.reason if not p.ok else
+                       ("thin (%d of %d)" % (p.n_matches, p.n_requested)
+                        if p.n_matches < p.n_requested else "ok")),
+        })
+    if not rows:
+        return
+    st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
 
 
 def render_matches_tab(pipe: Pipeline, result: M.MatchResult,
@@ -4503,6 +5481,119 @@ FORECAST_COLUMNS = ["horizon_min", "n_valid", "mean_return", "baseline_mean",
                     "lift", "p_value", "ci_low", "ci_high", "sufficient", "note"]
 
 
+#: Session-state key for the **Projection** tab's pinned separator bar.
+#:
+#: The dotted line down the middle of that chart is the boundary between the
+#: recent bars (left) and the projected bars (right).  It is pinned here as a
+#: *moment* so it stays on the same bar as the archive grows.  The pinned
+#: moment is the last *real* bar -- the one the projection was measured from
+#: -- and the line is drawn on the bar just after it, which is the first bar
+#: that belongs to the projection alone.
+PROJECTION_ANCHOR_KEY = "projection_anchor_ts"
+
+
+def projection_anchor_key(symbol: str) -> str:
+    """Session-state key for the Projection tab's pinned separator, per symbol.
+
+    Namespaced by symbol *and* resolution: the pinned moment belongs to one
+    instrument's tape, and a bar index means nothing across resolutions.
+    """
+    return state_key("{}_{}".format(PROJECTION_ANCHOR_KEY, str(symbol).upper()))
+
+
+def projection_pinned_anchor(
+    pipe: Pipeline,
+    symbol: str,
+    length: int,
+) -> Optional[pd.Timestamp]:
+    """The **Projection** tab's pinned separator bar, as a timestamp.
+
+    **The pin is the last bar of the reference window** -- the archive's
+    newest bar at the moment the reader arrived.  Everything to the right of
+    it is projection; everything to the left is real tape.
+
+    **The dotted line is drawn one bar past the pin.**  The pin is a *real*
+    bar, the one the projection was measured from, so a line standing on it
+    would point at the tape rather than at the projection.  The first bar
+    that belongs to the projection alone is the one after it, and that is
+    where the line goes.  Pinning the *anchor* and drawing the line at
+    ``anchor + 1`` keeps the two consistent: the line still holds still as
+    the archive grows, because the pin does.
+
+    **It is pinned as a moment, because a bar index cannot hold still.**  The
+    separator was drawn at the archive's *tail*, so every new bar moved it one
+    place to the right and dragged the whole history along with it.  The
+    history is supposed to be a fixed reference -- "what usually followed a
+    window shaped like the most recent one?" -- and a reference that slides
+    forward on its own is answering a different question every minute, because
+    the window it describes is a different window.
+
+    **The pin is taken once**, and re-taken only when the reader changes the
+    *Recent bars* control, which is a deliberate gesture to re-aim the chart.
+    A poll that brings new bars is not a gesture and must not move the line.
+
+    Returns ``None`` when there is no archive to pin yet.
+    """
+    key = projection_anchor_key(symbol)
+    width_key = key + "_width"
+    state = st.session_state
+
+    pinned = state.get(key)
+    width = state.get(width_key)
+    n = max(1, int(length))
+
+    if pipe is None or pipe.n_bars == 0:
+        return pinned
+
+    # A pin is needed when there is none, or when the reader has moved the
+    # control since the pin was taken.
+    needs_pin = pinned is None
+    if not needs_pin and width is not None and int(width) != n:
+        needs_pin = True
+
+    if needs_pin:
+        pinned = pipe.bars["timestamp"].iloc[pipe.n_bars - 1]
+        state[key] = pinned
+        state[width_key] = n
+    return pinned
+
+
+def projection_figure_span(
+    pipe: Pipeline,
+    symbol: str,
+    length: int,
+) -> Optional[Tuple[int, int, int]]:
+    """The Projection tab's ``(anchor, hist_start, hist_stop)``, or ``None``.
+
+    The **anchor** is the pinned moment the projection grows out of: the last
+    real bar, and the one the dotted line is drawn just past.  The **history
+    extent** is the span it delimits, ``anchor - length + 1 .. anchor``.
+
+    **All three come from one pinned moment**, which is what keeps the chart a
+    fixed reference.  The separator used to be drawn at the archive's *tail*,
+    so every new bar moved it one place to the right and dragged the history
+    with it -- a reference that slides describes a different window every
+    minute while its caption still claims to describe "the most recent N
+    bars".
+
+    The anchor is the *last* bar of the history, so the two are not
+    independent: given the anchor and the width, the history's extent
+    follows.  Returning all three together keeps them consistent, and the
+    *panel* chart below reuses them so the two charts -- which are compared
+    bar for bar -- share one boundary.
+
+    Returns ``None`` when the pinned moment is no longer in the archive, so
+    the caller reports it rather than drawing a line somewhere else.
+    """
+    anchor_ts = projection_pinned_anchor(pipe, symbol, length)
+    anchor = resolve_bar_index(pipe, anchor_ts)
+    if anchor is None:
+        return None
+    hist_start = max(0, anchor - int(length) + 1)
+    hist_stop = anchor + 1
+    return anchor, hist_start, hist_stop
+
+
 def _render_forecast_path(pipe: Pipeline, symbol: str, *, length: int, horizon: int,
                           k: int, amplitude_weight: float) -> None:
     """The path chart and its caption -- the part of this tab that needs no search run.
@@ -4523,6 +5614,25 @@ def _render_forecast_path(pipe: Pipeline, symbol: str, *, length: int, horizon: 
     cache key, serving one ticker's path against another's chart.
     """
     st.subheader("Where this usually goes next")
+
+    # **The separator is pinned, so the chart is a fixed reference.**
+    #
+    # The dotted line down the middle is the boundary between the recent bars
+    # and the projected ones.  It is drawn on the first bar that belongs to
+    # the projection alone -- the bar just after the archive's newest bar at
+    # the moment the reader arrived, which is stored as a *moment* and
+    # resolved against the archive on every pass.
+    #
+    # It used to be drawn at the archive's *tail*, so every new bar moved it one
+    # place to the right and dragged the whole history with it.  A reference
+    # that slides is not a reference: the window it describes is a different
+    # window every minute, so the chart was quietly answering a different
+    # question than the caption claimed.
+    span = projection_figure_span(pipe, symbol, length)
+    if span is None:
+        st.warning("The pinned separator bar is no longer in the archive.")
+        return
+    anchor, hist_start, hist_stop = span
 
     with st.spinner("Matching the most recent {} bars and aggregating…".format(length)):
         path = forecast_path_for(
@@ -4546,23 +5656,31 @@ def _render_forecast_path(pipe: Pipeline, symbol: str, *, length: int, horizon: 
         )
         return
 
+    # **The history runs from the pinned separator back to the left edge.**
+    #
+    # Passing the extent explicitly is what holds the chart still: the figure
+    # would otherwise draw the archive's *tail* as the history, which is what
+    # moved the line.
     fig = build_forecast_path_figure(
         pipe, path, history_bars=length,
         title="%s · %d bars of history, %d projected from %d matches"
               % (symbol, length, path.horizon,
                  path.n_matches),
+        projection_anchor=anchor,
+        hist_start=hist_start,
+        hist_stop=hist_stop,
     )
     st.plotly_chart(fig, width='stretch', key="forecast_path", config=chart_config())
 
     hint(
-        "Left of the dashed line is real tape: the archive's most recent {} bars. "
-        "Right of it is the <b>projection</b> — the median of where each of the {} "
-        "closest matching windows went over the following {} bars, each rebased to "
-        "its own final close. The green band is the middle half of those {} paths; "
-        "a wide band means the matches disagreed, and that disagreement is the most "
-        "useful thing on this chart.".format(
-            length, path.n_matches, path.horizon, path.n_matches
-        )
+        "The dashed line is where the <b>projection</b> starts — the first bar that "
+        "belongs to the projection alone. To its left is the real tape: the archive's "
+        "most recent {} bars, ending on the bar the projection was measured from. "
+        "Beyond it is the median of where each of the {} closest matching windows went "
+        "over the following {} bars, each rebased to its own final close. The green "
+        "band is the middle half of those {} paths; a wide band means the matches "
+        "disagreed, and that disagreement is the most useful thing on this chart."
+        .format(length, path.n_matches, path.horizon, path.n_matches)
     )
     hint(
         "<b>This chart is deliberately independent of your brush.</b> It always asks "
@@ -4579,12 +5697,12 @@ def _render_forecast_path(pipe: Pipeline, symbol: str, *, length: int, horizon: 
     # the requested 30 is normal near the end of an archive -- but it is also exactly
     # the situation where the median is least trustworthy, so the reader is told.
     if path.n_matches < FORECAST_PATH_MATCHES:
-        st.warning(
-            "Only **{}** of the requested {} matches had {} further bars of history "
-            "after them, so this median is computed from fewer windows than "
-            "intended. Matches without a forward path are dropped rather than counted "
-            "as flat, so the curve is honest — but it is thinner than it looks."
-            .format(path.n_matches, FORECAST_PATH_MATCHES, path.horizon)
+        _warn_short_matches(
+            path.n_matches, FORECAST_PATH_MATCHES, path.horizon,
+            detail="so this median is computed from fewer windows than "
+                   "intended. Matches without a forward path are dropped rather than "
+                   "counted as flat, so the curve is honest — but it is thinner than "
+                   "it looks.",
         )
 
     _render_panel_forecast_path(
@@ -4623,8 +5741,18 @@ def _render_panel_forecast_path(pipe: Pipeline, symbol: str, *, length: int,
         )
         return
 
-    start = n - int(length)
-    vec = np.asarray(matrix[start:n], dtype=float)
+    # **The same pinned window as the chart above.**  The two are drawn on the
+    # same axes and compared bar for bar, so the panel chart must ask about the
+    # *same* window -- not the archive's current tail, which has moved on since
+    # the chart above was drawn.
+    span = projection_figure_span(pipe, symbol, length)
+    if span is None:
+        st.info("The pinned separator bar is no longer in the archive.")
+        return
+    anchor, hist_start, hist_stop = span
+
+    start, stop = hist_start, hist_stop
+    vec = np.asarray(matrix[start:stop], dtype=float)
     try:
         vector = np.stack([M.zscore(vec[:, c]) for c in range(vec.shape[1])], axis=-1)
     except Exception:  # noqa: BLE001 - an unusable vector is not a failed page
@@ -4647,11 +5775,17 @@ def _render_panel_forecast_path(pipe: Pipeline, symbol: str, *, length: int,
         return
 
     ppath = bundle["path"]
+    # **The same pinned separator and the same history extent as the chart
+    # above** -- they are compared bar for bar, so a boundary that moved on one
+    # and not the other would make the comparison meaningless.
     fig = build_forecast_path_figure(
         pipe, ppath, history_bars=length,
         title="%s · %d bars, %d projected from %d matches across %d symbols"
               % (symbol, length, ppath.horizon, ppath.n_matches,
                  bundle["n_tickers"]),
+        projection_anchor=anchor,
+        hist_start=hist_start,
+        hist_stop=hist_stop,
     )
     st.plotly_chart(fig, width='stretch', key="forecast_path_panel",
                     config=chart_config())
@@ -4694,10 +5828,37 @@ def _render_panel_forecast_path(pipe: Pipeline, symbol: str, *, length: int,
         )
 
     if ppath.n_matches < k:
-        st.warning(
-            "Only **{}** of the requested {} matches had {} further bars of history "
-            "after them.".format(ppath.n_matches, k, ppath.horizon)
+        _warn_short_matches(ppath.n_matches, k, ppath.horizon)
+
+
+def _warn_short_matches(n_matches: int, k: int, horizon: int,
+                        detail: str = "") -> None:
+    """State that fewer matches had forward history than were asked for.
+
+    **One place, because the sentence is the same every time.**  Three charts report
+    a median built from fewer matches than were requested -- the reference path, the
+    pooled panel path and the brushed path -- and each wrote its own copy of the
+    warning.  They were not identical: two added a clause about the median being
+    thinner than it looks, one did not.  That difference was not deliberate; it was
+    three separate edits to the same sentence, and it is exactly the kind of drift
+    that makes a reader wonder whether a missing clause means something.
+
+    ``detail`` is the optional trailing clause, so the callers that want the
+    explanation keep it and the one that does not, does not.  The numbers are the
+    same in all three cases: how many matches survived, how many were asked for, and
+    how many further bars of real history each match needed.
+
+    The warning is raised by the *caller*, not here, because the threshold differs:
+    the reference path compares against its own fixed ``FORECAST_PATH_MATCHES``,
+    while the other two compare against the reader's ``k``.
+    """
+    st.warning(
+        "Only **{}** of the requested {} matches had {} further bars of history "
+        "after them{}".format(
+            n_matches, k, horizon,
+            (", " + detail) if detail else ".",
         )
+    )
 
 
 def _panel_price_span(bundle: Dict[str, Any]) -> str:
@@ -4900,10 +6061,9 @@ def _render_window_forecast(pipe: Pipeline, symbol: str,
         .format(length, path.n_matches, path.horizon)
     )
     if path.n_matches < k:
-        st.warning(
-            "Only **{}** of the requested {} matches had {} further bars of history "
-            "after them, so this median is computed from fewer windows than "
-            "intended.".format(path.n_matches, k, path.horizon)
+        _warn_short_matches(
+            path.n_matches, k, path.horizon,
+            detail="so this median is computed from fewer windows than intended.",
         )
 
 
@@ -4994,12 +6154,9 @@ def _render_projection_control(horizon: Optional[int]) -> int:
         return int(horizon)
 
     low, high = active_projection_bounds()
-    # Clamped into range rather than trusted: the stored value is whatever the reader
-    # last set under *this* key, and the bounds are derived from the active resolution.
-    # They cannot disagree while the key is namespaced -- but a session-state wipe, or
-    # a resolution whose ceiling moved, can leave a value outside the new range, and
-    # ``st.slider`` raises on exactly that rather than adjusting.  Silently widening
-    # the range to fit a stale value would instead offer horizons §BX censors.
+    # The value is read back through :func:`_resolve_projection`, which clamps it into
+    # ``[low, high]`` itself -- so the slider is never handed a stale value that
+    # ``st.slider`` would raise on.
     value = _resolve_projection(horizon)
 
     return int(st.slider(
@@ -5329,11 +6486,9 @@ def render_window_tab(pipe: Pipeline, symbol: str, *,
     every reader's brush, settings and last run on deploy -- so the scope string stays
     and only the tab's *name* moves.
 
-    ``symbol`` is taken as an argument rather than read from ``SYMBOL_FOR_HELP``,
-    which is a *help-copy* bridge holding the **Price** tab's ticker, not cache
-    identity.  The signature below has to name the ticker, or a previous ticker's
-    result could be served against this one's chart -- and a module list that exists
-    to interpolate ``[[SYMBOL]]`` into prose is the wrong thing to hang that on.
+    ``symbol`` is taken as an argument rather than read from ``SYMBOL_FOR_HELP`` --
+    see :func:`render_forecast_tab` for why that bridge is the wrong thing to hang
+    cache identity on.
 
     **No ``length`` parameter, deliberately.**  The window's width here is whatever
     the reader brushed -- a brush of N bars is a window of N bars -- so a parameter
@@ -5634,8 +6789,12 @@ def panel_sector_file() -> str:
     Path, not root, because that is what :func:`timeseries.store.read_sectors`
     takes -- it answers "what is in this file", so a caller holding a file should
     not have to unwind it to a directory and rejoin it.
+
+    The *name* comes from :data:`PANEL_SECTOR_NAME`, which is the store's own
+    :data:`timeseries.store.CONSTITUENTS_NAME`, so this reader and the store
+    cannot disagree about what the sidecar is called.
     """
-    return constituents_path(panel_root_for())
+    return os.path.join(panel_root_for(), PANEL_SECTOR_NAME)
 
 
 def render_archive_sync() -> None:
@@ -5691,21 +6850,94 @@ def render_archive_sync() -> None:
             "No archive yet at `data/sp500_panel/`."
         )
     else:
+        # --- the cohort frontier, not the union maximum -------------------- #
+        # The old wording was "Up to date. Newest session <date>", where <date>
+        # was the **newest session any ticker held**.  The archive holds three
+        # instruments that trade 24/7, so that date was always a weekend and
+        # always ahead of the equity cohort -- the sidebar reported "up to date"
+        # while 500 of 503 tickers were nine sessions behind.
+        #
+        # The frontier is the date **most** tickers have reached, and it is the
+        # number that answers "can I trust this archive?".
+        frontier = status["frontier"]
         newest = status["newest"].strftime("%d %b %Y") if status["newest"] else "—"
-        age = status["age_days"]
-        if age is None:
+        frontier_txt = frontier.strftime("%d %b %Y") if frontier else "—"
+
+        # The age is counted in **trading sessions**, because the archive is
+        # measured in sessions.  A calendar-day count made a Friday archive look
+        # three days stale on Monday morning, which is both wrong and a good way
+        # to teach someone to ignore a warning.
+        age_sessions = status["age_sessions"]
+        if age_sessions is None:
             age_txt = "unknown age"
-        elif age <= 0:
-            age_txt = "from today"
+        elif age_sessions <= 0:
+            age_txt = "caught up"
         else:
-            age_txt = "{} session{} old".format(age, "" if age == 1 else "s")
+            age_txt = "{} session{} behind".format(
+                age_sessions, "" if age_sessions == 1 else "s")
+
+        at_frontier = status["at_frontier"]
+        behind = status["behind_frontier"]
+        total = status["tickers"]
+
         if status["stale"]:
             st.sidebar.warning(
-                "Newest session **{}** — {}.".format(newest, age_txt),
+                "Cohort through **{}** — {}.".format(frontier_txt, age_txt)
             )
         else:
             st.sidebar.success(
-                "Up to date. Newest session **{}** ({}).".format(newest, age_txt)
+                "Cohort through **{}** ({}).".format(frontier_txt, age_txt)
+            )
+
+        # Coverage: how much of the cohort is actually at the frontier.  This is
+        # the number that distinguishes "the archive is a day behind" from "the
+        # archive is one ticker behind", which are different problems with
+        # different fixes.
+        if total:
+            st.sidebar.caption(
+                "**{:,} of {:,}** tickers at the frontier".format(at_frontier, total)
+            )
+        if behind:
+            laggers = ", ".join(status["lagging_tickers"][:6])
+            if len(status["lagging_tickers"]) > 6:
+                laggers += " +{} more".format(len(status["lagging_tickers"]) - 6)
+            st.sidebar.caption(
+                "Behind: **{}** ({})".format(behind, laggers)
+            )
+
+        # The gap is only recoverable while it is inside Yahoo's 30-day window.
+        # After that the missing sessions are gone for good, so saying so is the
+        # difference between "press the button" and "it is too late".
+        missing = status["missing_sessions"]
+        if missing:
+            oldest_missing = missing[0]
+            recoverable = _within_fetch_window(oldest_missing)
+            if recoverable:
+                st.sidebar.caption(
+                    "Missing **{}** session{} ({} – {}); still inside Yahoo's "
+                    "30-day window, so a sync can recover "
+                    "them.".format(
+                        len(missing), "" if len(missing) == 1 else "s",
+                        missing[0], missing[-1],
+                    )
+                )
+            else:
+                st.sidebar.caption(
+                    "Missing **{}** session{} ({} – {}); these are **older than "
+                    "Yahoo's 30-day window** and can no longer be fetched.".format(
+                        len(missing), "" if len(missing) == 1 else "s",
+                        missing[0], missing[-1],
+                    )
+                )
+
+        # Tickers that trade when the equities do not are reported separately, so
+        # the frontier is not silently dragged forward by them.
+        if status["ahead_frontier"]:
+            st.sidebar.caption(
+                "Ahead of the cohort: **{}** ticker{} (24/7 instruments)".format(
+                    status["ahead_frontier"],
+                    "" if status["ahead_frontier"] == 1 else "s",
+                )
             )
 
     # A progress bar and a spinner are both stateful widgets, so the work runs to
@@ -6927,6 +8159,30 @@ def _scope_keys(scope: str) -> Tuple[str, str]:
     return (TICKER_KEY, "{}ticker_input".format(scope))
 
 
+def _recent_tickers() -> List[str]:
+    """The ordered list of recently used tickers, most recent first.
+
+    Seeded from :data:`DEFAULT_RECENT_TICKERS` on first access and capped at
+    :data:`MAX_RECENT_TICKERS`.
+    """
+    if RECENT_TICKERS_KEY not in st.session_state:
+        st.session_state[RECENT_TICKERS_KEY] = list(DEFAULT_RECENT_TICKERS)
+    return st.session_state[RECENT_TICKERS_KEY]
+
+
+def _add_recent_ticker(symbol: str) -> None:
+    """Record ``symbol`` as recently used, moving it to the front of the list.
+
+    Duplicates are removed before re-insertion at the front, and the list is
+    truncated to :data:`MAX_RECENT_TICKERS` so the oldest entry drops off.
+    """
+    recent = _recent_tickers()
+    if symbol in recent:
+        recent.remove(symbol)
+    recent.insert(0, symbol)
+    del recent[MAX_RECENT_TICKERS:]
+
+
 def resolve_ticker(scope: str = "price") -> Optional[ResolvedScope]:
     """What the scope is currently built on: symbol and resolution.
 
@@ -6965,7 +8221,6 @@ def resolve_ticker(scope: str = "price") -> Optional[ResolvedScope]:
     delisted symbol) is reported by :func:`render_ticker_input`, which is the only
     place the download and its messages happen.
     """
-    cfg = FETCH_SCOPES["app"]
     ticker_key, input_key = _scope_keys("app")
     pending_key = ticker_key + PENDING_SUFFIX
 
@@ -7027,6 +8282,7 @@ def resolve_ticker(scope: str = "price") -> Optional[ResolvedScope]:
             # different bars.  Clearing it is what stops the page reporting yesterday's
             # match count over today's price chart.
             st.session_state[ticker_key] = sym
+            _add_recent_ticker(sym)
             reset_query_state("app", sym)
         else:
             # The symbol stays as it was.  Adopting one with no bars would leave the
@@ -7124,7 +8380,12 @@ def render_ticker_input(scope: str) -> Optional[str]:
         # Safe while typing: this expression is constant for as long as the user is
         # editing, so Streamlit does not reset the widget under them. It only changes
         # value at the moment a fetch resolves a new symbol.
-        raw = st.text_input(
+        #
+        # The widget is *drawn* here, not read: the text this box holds is read back
+        # from session state by the fetch button, and the value that matters is the
+        # one the reader has committed to, not the one they are halfway through
+        # typing.  So the return value is deliberately discarded.
+        st.text_input(
             cfg["widget_label"], key=input_key,
             value=st.session_state[ticker_key],
             max_chars=16,
@@ -7310,12 +8571,34 @@ def render_sidebar() -> Dict[str, Any]:
     :func:`help_dialog` button at the top of this sidebar.
     """
     with st.sidebar:
-        st.header("Controls")
-        st.caption(
-            "Hover the ⓘ beside any control for what it changes. Each tab carries its "
-            "own search settings and its own **Run match** button, so the two analyses "
-            "can be aimed at different windows."
+
+        # Recently used tickers as quick-load buttons.  Clicking one sets the symbol
+        # in force and triggers a fetch, exactly as if the reader had typed it and
+        # pressed **Fetch**.  The fetched symbol moves to the front of the list.
+        st.subheader("Recently used tickers")
+        recent = _recent_tickers()
+        ticker_key, input_key = _scope_keys("app")
+        pending_key = ticker_key + PENDING_SUFFIX
+        cols = st.columns(4, gap="small")
+        for i, sym in enumerate(recent):
+            with cols[i % 4]:
+                if st.button(sym, key="recent_{}".format(sym), width='stretch',
+                             help="Load {} bars".format(sym)):
+                    st.session_state[input_key] = sym
+                    st.session_state[pending_key] = True
+                    st.rerun()
+
+        # Tighten the button grid: remove the gap between columns so the buttons sit
+        # flush against each other.
+        st.markdown(
+            '<style>[data-testid="stColumn"] {padding: 0 !important; gap: 0 !important;} '
+            '[data-testid="stColumn"] > div {margin: 0 !important; padding: 0 !important;} '
+            '[data-testid="stButton"] {margin: 0 !important;} '
+            '[data-testid="stButton"] > button {margin: 0 !important; padding: 0.125rem 0.25rem !important;}</style>',
+            unsafe_allow_html=True,
         )
+
+        st.divider()
 
         # Ticker input for the whole session.
         render_ticker_input("app")
@@ -7335,23 +8618,9 @@ def render_sidebar() -> Dict[str, Any]:
         # ``main()`` resolves the symbol before this function is called and refuses to
         # draw the page at all if it cannot be resolved.
         #
-        # **What is left is the dial and nothing else.**  This used to open with a
-        # "① How windows are matched" section -- a subheader, two prose blocks and an
-        # expander wrapped around the one slider below -- which is the arrangement that
-        # put the *explanation* of a control in front of the reader instead of attached
-        # to it, and left an expander whose only content was a single slider.
-        #
-        # The prose is gone rather than relocated.  Everything it said is still on the
-        # page: the brush-is-the-window rule in :func:`help_dialog`'s workflow and in
-        # the per-tab guides, and the dial's own behaviour in its ``help`` tooltip,
-        # which is shown by the hover this sidebar already invites the reader to try.
-        # Duplicating it here meant two copies to keep in step, and a reader who wanted
-        # to *do* something had to scroll past three paragraphs to reach the control.
-        #
-        # ``amplitude_weight`` stays regardless -- it is a scoring rule shared across
-        # both instruments on purpose, so a distance or a percentile means the same
-        # thing wherever it was produced.  Two copies would let the two tabs disagree
-        # about the same number.
+        # ``amplitude_weight`` stays at the bottom of the sidebar -- it is a scoring
+        # rule shared across both instruments on purpose, so a distance or a
+        # percentile means the same thing wherever it was produced.
         amplitude_weight = st.slider(
             "Size of move", min_value=0.0, max_value=2.0, value=1.0, step=0.05,
             help="How much a window's **size of move** counts, separate from its "
@@ -7821,11 +9090,21 @@ def main() -> None:
 
     st.sidebar.divider()
     st.sidebar.markdown("**Archive status**")
+    # Two different archives are described here and they used to be presented as
+    # one.  The metrics below describe the **in-memory frame for one ticker**;
+    # the panel archive on disk is a *cohort* of hundreds of tickers, and the two
+    # "bars" numbers are not comparable.  The captions now say which is which,
+    # because "bars loaded: 4,418" next to "bars: 4,666,346" reads as a
+    # discrepancy rather than as two different subjects.
+    st.sidebar.caption(
+        "**{}** — in-memory, this ticker only".format(symbol)
+    )
     m1, m2 = st.sidebar.columns(2)
     m1.metric("bars loaded", "{:,}".format(pipe.n_bars),
               help="Rows remaining in the cleaned frame after dropping the ~20-bar "
-                   "feature warm-up. All bar indices elsewhere refer to this frame, "
-                   "not to the raw download.")
+                   "feature warm-up, for this ticker only. All bar indices elsewhere "
+                   "refer to this frame, not to the raw download and not to the "
+                   "on-disk panel archive.")
     m2.metric("window", "{} bars".format(pipe.length),
               help="The default query length, in {} bars — {} of continuous trading. A brush "
                    "defines its own length instead, and a session bounds it from "
@@ -8053,8 +9332,8 @@ def main() -> None:
     # ---------------- Use the selection's own length ----------------------- #
     # No ``bounds`` is passed, so the resolved window is exactly the drawn span.  A
     # brush of N bars becomes an N-bar query wherever it was drawn, and one crossing
-    # an overnight close keeps both its width and its position.  ``MAX_QUERY_BARS``
-    # caps the sidebar slider, not a brush, so a 600-bar drag is still 600 bars drawn;
+    # an overnight close keeps both its width and its position.  The sidebar slider's
+    # cap bounds the slider, not a brush, so a 600-bar drag is still 600 bars drawn;
     # nothing narrows it but the archive itself.
     start_idx, stop_idx, length = resolve_query_window(
         price_brush, start_idx, end_idx, pipe.length, n
@@ -8462,7 +9741,7 @@ def main() -> None:
                 )
 
     with tab_live:
-        render_live_tab(pipe, symbol)
+        render_live_tab(pipe, symbol, amplitude_weight=cfg["amplitude_weight"])
 
     with tab_panel:
         # The panel reads its own archive rather than `pipe`, so it is rendered even

@@ -115,6 +115,41 @@ def _write_panel(root, sessions, bars=390):
     pd.DataFrame(rows).to_csv(os.path.join(root, "manifest.csv"), index=False)
 
 
+def _write_cohort(root, per_ticker, bars=390):
+    """Create an archive holding ``{ticker: [session, ...]}``.
+
+    Each ticker gets its own ``ticker=`` directory, and a session in the mapping
+    becomes one ``date=`` partition holding ``bars`` rows.
+    """
+    import pandas as pd
+
+    os.makedirs(root, exist_ok=True)
+    rows = []
+    idx = pd.date_range("2026-09-01 13:30", periods=bars, freq="1min", tz="UTC")
+    for sym, days in per_ticker.items():
+        for day in days:
+            part = os.path.join(root, "ticker={}".format(sym), "date={}".format(day))
+            os.makedirs(part, exist_ok=True)
+            pd.DataFrame(
+                {
+                    "timestamp": idx,
+                    "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+                    "session": day,
+                    "ticker": sym,
+                }
+            ).to_parquet(os.path.join(part, "bars.parquet"))
+            rows.append(
+                {
+                    "ticker": sym, "session": day, "bars": bars,
+                    "fingerprint": "x", "observed_fingerprint": "x",
+                    "first_bar": str(idx[0]), "last_bar": str(idx[-1]), "n_revisions": 0,
+                }
+            )
+    if rows:
+        pd.DataFrame(rows).to_csv(os.path.join(root, "manifest.csv"), index=False)
+    return root
+
+
 class TestArchiveStatus:
     def test_a_missing_archive_reports_never_synced_rather_than_raising(self, tmp_path):
         # The sidebar renders on first load, long before any sync has run.  Raising
@@ -154,6 +189,178 @@ class TestArchiveStatus:
         assert st["newest"].date() == datetime(2026, 10, 2).date()
         assert st["age_days"] == 0
         assert st["stale"] is False
+
+
+class TestArchiveStatusCohort:
+    """The cohort frontier: the date *most* tickers have reached.
+
+    The bug these cover is not hypothetical.  The archive holds three instruments
+    that trade 24/7 (``BTC-USD``, ``HO=F``, ``NG=F``) alongside the equity
+    cohort, so the *union* of sessions is always ahead of the cohort -- and the
+    old status reported the union's maximum, which said "up to date" while 500 of
+    503 equity tickers were nine sessions behind.
+    """
+
+    def test_the_frontier_is_the_mode_of_the_newest_sessions_not_the_maximum(self, tmp_path):
+        # 10 tickers reached Friday; one 24/7 instrument reached Sunday.
+        root = str(tmp_path / "panel")
+        cohort = {sym: ["2026-10-02", "2026-10-09"] for sym in
+                  ["A{}".format(i) for i in range(10)]}
+        cohort["BTC-USD"] = ["2026-10-02", "2026-10-09", "2026-10-11"]
+        _write_cohort(root, cohort)
+        st = sync.archive_status(root, today=datetime(2026, 10, 12, 12, 0, tzinfo=EASTERN))
+        assert st["frontier"].date() == datetime(2026, 10, 9).date()
+        assert st["newest"].date() == datetime(2026, 10, 11).date()
+        assert st["at_frontier"] == 10
+        assert st["ahead_frontier"] == 1
+        assert st["behind_frontier"] == 0
+
+    def test_a_ticker_behind_the_frontier_is_named_and_counted(self, tmp_path):
+        root = str(tmp_path / "panel")
+        cohort = {sym: ["2026-10-02", "2026-10-09"] for sym in
+                  ["A{}".format(i) for i in range(5)]}
+        cohort["LAGGARD"] = ["2026-10-02"]
+        _write_cohort(root, cohort)
+        st = sync.archive_status(root, today=datetime(2026, 10, 12, 12, 0, tzinfo=EASTERN))
+        assert st["behind_frontier"] == 1
+        assert st["lagging_tickers"] == ["LAGGARD"]
+        assert st["at_frontier"] == 5
+
+    def test_the_archive_is_stale_even_though_some_ticker_is_current(self, tmp_path):
+        # The exact failure the old code had: a 24/7 ticker's recent session
+        # made the union fresh, so the sidebar said "up to date" while the
+        # cohort was seven sessions behind.  The cohort's age decides staleness.
+        root = str(tmp_path / "panel")
+        cohort = {sym: ["2026-10-01"] for sym in ["A{}".format(i) for i in range(10)]}
+        cohort["BTC-USD"] = ["2026-10-01", "2026-10-02", "2026-10-11"]
+        _write_cohort(root, cohort)
+        st = sync.archive_status(root, today=datetime(2026, 10, 12, 12, 0, tzinfo=EASTERN))
+        assert st["stale"] is True
+        assert st["age_sessions"] == 7
+        assert st["newest"].date() == datetime(2026, 10, 11).date()
+        assert st["frontier"].date() == datetime(2026, 10, 1).date()
+
+    def test_age_is_counted_in_trading_sessions_not_calendar_days(self, tmp_path):
+        # Friday -> Monday is three calendar days but one trading session.  A
+        # calendar-day count made a perfectly current Friday archive look three
+        # days stale on Monday morning, which teaches people to ignore warnings.
+        root = str(tmp_path / "panel")
+        _write_cohort(root, {"A": ["2026-10-09"]})   # a Friday
+        st = sync.archive_status(root, today=datetime(2026, 10, 12, 12, 0, tzinfo=EASTERN))
+        assert st["age_days"] == 3
+        assert st["age_sessions"] == 1
+        assert st["stale"] is False
+
+    def test_a_weekend_gap_does_not_make_a_current_archive_look_stale(self, tmp_path):
+        root = str(tmp_path / "panel")
+        _write_cohort(root, {"A": ["2026-10-09"]})
+        st = sync.archive_status(root, today=datetime(2026, 10, 12, 9, 0, tzinfo=EASTERN))
+        assert st["age_sessions"] == 1
+        assert st["stale"] is False
+
+    def test_the_missing_sessions_are_the_weekdays_the_cohort_has_not_reached(self, tmp_path):
+        # The cohort is at Friday 2026-10-09; a 24/7 instrument has reached
+        # Monday 2026-10-12 and Tuesday 2026-10-13.  Those two weekdays are what
+        # the cohort is missing, and the weekend in between is not -- the equity
+        # cohort does not trade on a weekend, and reporting "missing Saturday"
+        # is the kind of false alarm that makes people stop reading the warning.
+        root = str(tmp_path / "panel")
+        cohort = {sym: ["2026-10-09"] for sym in ["A{}".format(i) for i in range(5)]}
+        cohort["BTC-USD"] = ["2026-10-09", "2026-10-10", "2026-10-11", "2026-10-12", "2026-10-13"]
+        _write_cohort(root, cohort)
+        st = sync.archive_status(root, today=datetime(2026, 10, 14, 12, 0, tzinfo=EASTERN))
+        assert st["missing_sessions"] == ["2026-10-12", "2026-10-13"]
+
+    def test_a_single_ticker_archive_has_its_own_frontier(self, tmp_path):
+        root = str(tmp_path / "panel")
+        _write_cohort(root, {"A": ["2026-10-01", "2026-10-02"]})
+        st = sync.archive_status(root, today=datetime(2026, 10, 5, 12, 0, tzinfo=EASTERN))
+        assert st["frontier"].date() == datetime(2026, 10, 2).date()
+        assert st["at_frontier"] == 1
+        assert st["behind_frontier"] == 0
+
+
+class TestArchiveIntegrity:
+    """A partition that cannot be read must be *reportable*.
+
+    A Parquet file whose bytes were altered still has a valid footer: the footer
+    records *where* the data pages are, not *what* they contain.  So a file that
+    has lost a byte anywhere in its data region parses cleanly and only fails
+    when the pages are decoded -- which every reader in this project caught and
+    moved on from, silently.  That is how 442 of 504 daily archives became
+    unreadable while the archive reported itself as holding 191,181 rows instead
+    of 4,164,637, with no error anywhere.
+    """
+
+    def test_a_corrupt_partition_is_reported_rather_than_counted_as_absent(self, tmp_path):
+        root = str(tmp_path / "panel")
+        _write_cohort(root, {"AAA": ["2026-10-01"], "BBB": ["2026-10-01"]})
+        # Truncate one partition so its data pages are gone.
+        victim = os.path.join(root, "ticker=BBB", "date=2026-10-01", "bars.parquet")
+        with open(victim, "r+b") as fh:
+            fh.truncate(64)
+        rep = sync.archive_integrity(root)
+        assert rep["n_partitions"] == 2
+        assert rep["n_unreadable"] == 1
+        assert rep["unreadable_tickers"] == ["BBB"]
+        assert rep["ok"] is False
+
+    def test_a_healthy_archive_reports_no_unreadable_partitions(self, tmp_path):
+        root = str(tmp_path / "panel")
+        _write_cohort(root, {"AAA": ["2026-10-01"], "BBB": ["2026-10-01"]})
+        rep = sync.archive_integrity(root)
+        assert rep["n_unreadable"] == 0
+        assert rep["ok"] is True
+
+    def test_the_reader_reports_the_corrupt_partition_instead_of_dropping_it_silently(self, tmp_path):
+        # The reader still *skips* an unreadable partition -- one bad file must
+        # not stop the other 500 from being served.  But the skip is now
+        # reportable, so the loss cannot be invisible.
+        from timeseries.store import PanelStore
+
+        root = str(tmp_path / "panel")
+        _write_cohort(root, {"AAA": ["2026-10-01"], "BBB": ["2026-10-01"]})
+        victim = os.path.join(root, "ticker=BBB", "date=2026-10-01", "bars.parquet")
+        with open(victim, "r+b") as fh:
+            fh.truncate(64)
+
+        seen = []
+        df = PanelStore(root).load(on_unreadable=lambda sym, day, path: seen.append((sym, day)))
+        assert len(seen) == 1
+        assert seen[0][0] == "BBB"
+        # The healthy ticker's rows are still served.
+        assert set(df["ticker"]) == {"AAA"}
+
+    def test_a_reader_without_the_callback_still_works(self, tmp_path):
+        # The default is to stay quiet, so existing callers are unaffected.
+        from timeseries.store import PanelStore
+
+        root = str(tmp_path / "panel")
+        _write_cohort(root, {"AAA": ["2026-10-01"], "BBB": ["2026-10-01"]})
+        victim = os.path.join(root, "ticker=BBB", "date=2026-10-01", "bars.parquet")
+        with open(victim, "r+b") as fh:
+            fh.truncate(64)
+        df = PanelStore(root).load()
+        assert set(df["ticker"]) == {"AAA"}
+
+
+class TestSessionMap:
+    def test_the_map_is_per_ticker_not_a_union(self, tmp_path):
+        from timeseries.store import PanelStore
+
+        root = str(tmp_path / "panel")
+        _write_cohort(root, {"AAA": ["2026-10-01", "2026-10-02"],
+                             "BBB": ["2026-10-01"]})
+        m = PanelStore(root).session_map()
+        assert m == {"AAA": ["2026-10-01", "2026-10-02"], "BBB": ["2026-10-01"]}
+
+    def test_the_union_still_answers_the_union_question(self, tmp_path):
+        from timeseries.store import PanelStore
+
+        root = str(tmp_path / "panel")
+        _write_cohort(root, {"AAA": ["2026-10-01", "2026-10-02"],
+                             "BBB": ["2026-10-01"]})
+        assert PanelStore(root).sessions() == ["2026-10-01", "2026-10-02"]
 
 
 # --------------------------------------------------------------------------- #

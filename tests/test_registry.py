@@ -340,7 +340,6 @@ class TestTheWriteIsAtomic:
         with pytest.raises(OSError):
             register_symbols(root, ["NVDA"])
 
-        path = constituents_path(root)
         assert os.path.isdir(root)
         leftovers = [f for f in os.listdir(root) if f != CONSTITUENTS_NAME]
         assert leftovers == [], "a failed write left %r behind" % leftovers
@@ -497,3 +496,76 @@ def minute_frame(bars: int = 390, day: str = SETTLED) -> pd.DataFrame:
         "timestamp": idx,
         "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
     })
+
+# --------------------------------------------------------------------------- #
+# The incremental skip rule
+# --------------------------------------------------------------------------- #
+class TestTheIncrementalSkipIsPerTicker:
+    """A day is skippable only when **every** ticker already holds it.
+
+    The bug this covers starved the archive for nine trading sessions and was
+    invisible: the downloader computed an empty work list, printed "Nothing to
+    do", and exited 0.
+
+    The cause was the union.  The archive holds three instruments that trade 24/7
+    (``BTC-USD``, ``HO=F``, ``NG=F``), so a weekend they hold was a weekend the
+    entire equity cohort was then told it did not need.  The union of a cohort's
+    sessions is not a property any member of the cohort has.
+    """
+
+    def test_a_day_held_only_by_a_24_7_ticker_is_still_fetched(self):
+        per_ticker = {
+            "AAPL": ["2026-10-01", "2026-10-02"],
+            "MSFT": ["2026-10-01", "2026-10-02"],
+            "BTC-USD": ["2026-10-01", "2026-10-02", "2026-10-03"],  # a Saturday
+        }
+        assert DS._all_tickers_hold(per_ticker, ["AAPL", "MSFT"], "2026-10-03") is False
+        assert DD._all_tickers_hold(per_ticker, ["AAPL", "MSFT"], "2026-10-03") is False
+
+    def test_a_day_held_by_every_ticker_is_skipped(self):
+        per_ticker = {
+            "AAPL": ["2026-10-01", "2026-10-02"],
+            "MSFT": ["2026-10-01", "2026-10-02"],
+        }
+        assert DS._all_tickers_hold(per_ticker, ["AAPL", "MSFT"], "2026-10-02") is True
+        assert DD._all_tickers_hold(per_ticker, ["AAPL", "MSFT"], "2026-10-02") is True
+
+    def test_a_ticker_missing_from_the_archive_forces_the_day_to_be_fetched(self):
+        # A newly-added symbol has no history, so every day is a day it needs.
+        # The cost of fetching a day already held is one wasted request; the cost
+        # of skipping it is a permanent hole in that symbol's history.
+        per_ticker = {"AAPL": ["2026-10-01", "2026-10-02"]}
+        assert DS._all_tickers_hold(per_ticker, ["AAPL", "NEW"], "2026-10-02") is False
+        assert DD._all_tickers_hold(per_ticker, ["AAPL", "NEW"], "2026-10-02") is False
+
+    def test_an_empty_universe_fetches_rather_than_skipping(self):
+        # Skipping everything would be the worst outcome: a run that fetches
+        # nothing and reports success.
+        assert DS._all_tickers_hold({}, [], "2026-10-02") is False
+        assert DD._all_tickers_hold({}, [], "2026-10-02") is False
+
+    def test_the_minute_downloader_fetches_a_weekend_the_equities_are_missing(self, monkeypatch, tmp_path):
+        """End to end: an archive holding a weekend session only (because of the
+        24/7 ticker) must still trigger a fetch for the equity cohort."""
+        root = str(tmp_path)
+        # Build an archive holding Saturday 2026-10-03 for BTC-USD only.
+        part = os.path.join(root, "ticker=BTC-USD", "date=2026-10-03")
+        os.makedirs(part, exist_ok=True)
+        pd.DataFrame({
+            "timestamp": pd.date_range("2026-10-03 13:30", periods=390, freq="1min", tz="UTC"),
+            "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+            "session": "2026-10-03", "ticker": "BTC-USD",
+        }).to_parquet(os.path.join(part, "bars.parquet"), index=False)
+
+        fetched = {}
+
+        def fake_fetch(symbols, start, end, **kwargs):
+            fetched["symbols"] = list(symbols)
+            fetched["start"], fetched["end"] = start, end
+            return {s: minute_frame() for s in symbols}
+
+        monkeypatch.setattr(DS, "_fetch", fake_fetch)
+        DS.main(["--root", root, "--tickers", "AAPL",
+                 "--start", "2026-10-01", "--end", "2026-10-03", "--incremental"])
+        # The day was fetched, not skipped, because AAPL did not hold it.
+        assert fetched, "the day was skipped even though AAPL did not hold it"

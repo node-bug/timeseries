@@ -54,7 +54,7 @@ import pandas as pd
 from . import matrix_profile as MP
 from .features import build_features, finalize_features
 from .forecast import MIN_MATCHES, conditional_forecast
-from .matching import DEFAULT_AMPLITUDE_WEIGHT, forward_horizon_valid_mask
+from .matching import DEFAULT_AMPLITUDE_WEIGHT
 from .store import PanelStore, session_et
 
 __all__ = [
@@ -238,12 +238,13 @@ def _horizon_admissible(frame: pd.DataFrame, m: int,
     one session.  If none does, the rule has nothing to say and every window is
     admissible.  That is honest: on daily there is no in-session window to protect.
 
-    ``forward_horizon_valid_mask`` is imported **into this function's scope**, not
-    only where :func:`find_panel_matches` happens to import it.  A function-local
-    import in a *different* function does not put the name in module scope, so
-    calling it from here raised ``NameError`` at runtime -- a failure that only
-    appeared once a frame actually needed censoring, and never on the uncensored
-    path that returns early.
+    ``forward_horizon_valid_mask`` is imported **into this function's scope**.
+    A function-local import in a *different* function does not put the name in
+    module scope, so calling it from here raised ``NameError`` at runtime -- a
+    failure that only appeared once a frame actually needed censoring, and never
+    on the uncensored path that returns early.  The import is local to this
+    function for the same reason it is not at module scope: this is the only
+    place that calls it.
     """
     from .matching import forward_horizon_valid_mask
 

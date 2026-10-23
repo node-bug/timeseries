@@ -18,7 +18,7 @@ observations is the failure mode this project exists to avoid.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Mapping, Optional
 
 import numpy as np
@@ -66,7 +66,13 @@ def selection_variance_inflation(k: int, horizon: Optional[int] = None) -> float
 # §E: below this, suppress the forecast entirely rather than print a number.
 MIN_MATCHES = 30
 
-#: Variance inflation due to selection, by matched-sample size ``k``.
+#: Variance inflation due to selection, by forward-return **horizon** in bars.
+#:
+#: The matched-sample size ``k`` is *not* a key here: the factors were measured at
+#: k=50 and already embed that sample size, so
+#: :func:`selection_variance_inflation` accepts ``k`` for interface stability and
+#: ignores it.  The table is keyed on the horizon because that is what the inflation
+#: actually varies with -- see "Why it depends on the horizon" below.
 #:
 #: PLAN.md §BW.  Measured on pure random walks, where there is provably no signal: the
 #: matched mean is **unbiased** (``mean z = +0.08``) but its **dispersion is inflated**,
@@ -82,30 +88,14 @@ MIN_MATCHES = 30
 #: population the baseline is drawn from -- measured, every such change left the rate
 #: untouched.
 #:
-#: **Why this is a per-``k`` variance factor and not one constant.**  The measured
+#: **Why this is a variance factor and not one constant on ``z``.**  The measured
 #: inflation of the z-statistic *shrinks as ``k`` grows* -- ``I(k=30) = 1.22``,
 #: ``I(k=50) = 1.83``, ``I(k=100) = 1.79`` at h=5 -- so it is not a fixed widening of
 #: the standard error.  It is a fixed widening of the *variance* of the mean, which a
 #: constant on ``z`` would misapply.  The variance inflation is therefore tabulated
-#: against ``k`` and interpolated, and it is **conservative by construction**: it only
+#: and interpolated, and it is **conservative by construction**: it only
 #: ever enlarges the null, so a corrected p-value is never smaller than the naive one
 #: and a forecast that survives it survived a stricter test.
-#: Total variance inflation due to selection, measured on pure random walks.
-#:
-#: PLAN.md §BW.  Measured under the exact placebo configuration (L=60, k=50, the four
-#: pipeline horizons), where there is provably no signal to find.  The matched mean is
-#: **unbiased** (``mean z = +0.08``) but its **dispersion is inflated**, so
-#: ``|z| > 1.96`` fires on 38% of noise seeds instead of 5%.
-#:
-#: Every *distributional* explanation was measured and ruled out -- excess kurtosis is
-#: identical between matched and pool samples (t = −0.7), IQR ratio 0.98,
-#: chronological autocorrelation negligible (ESS 57.5 vs 54.2), position in the series
-#: identical (0.485 vs 0.487), local volatility if anything *lower*.  Splitting the
-#: matched set in half and comparing the halves, with no baseline at all, still fires
-#: on 20%, so the two halves of the matched set are not exchangeable either.  What
-#: remains is the selection itself, and it is not removable by changing which
-#: population the baseline is drawn from -- measured, every such change left the rate
-#: untouched.
 #:
 #: **Why it depends on the horizon.**  The forward return of a matched window is
 #: anchored at its last bar (§Z1) and adjacent matched windows are only ``L`` bars
