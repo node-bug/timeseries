@@ -60,7 +60,7 @@ body**, above the charts it changes:
 
 | Where | Feeds | Notes |
 |---|---|---|
-| **Price** tab's box | Price, Matches, Quality, Backtest | The app title, price chart and help text follow this one |
+| **Price** tab's box | Price, Quality, Backtest | The app title, price chart and help text follow this one |
 | **Forecast** tab's box | Forecast, Projection and Progression | Starts on Price's ticker, then keeps its own; **Projection** and **Progression** chart the same ticker without a box of their own |
 
 Either box takes any symbol Yahoo accepts (`AAPL`, `MSFT`, `BRK-B`, …). Switching

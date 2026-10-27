@@ -572,9 +572,9 @@ class TestAppAnchorWiring:
     centred offset would leave all of them green, because `aligned_view` is fine in
     isolation.  These assert the call sites, so that has to fail too.
 
-    The scope narrowed when the Price tab's shared anchor was removed.  The Matches
-    tab still aligns its query and match panels at one offset, and
-    `_render_best_match_pair` is where that happens, so those guards stand.  The Price
+    The scope narrowed when the Price tab's shared anchor was removed.  The
+    `_render_best_match_pair` function is where that alignment happens, so those
+    guards stand.  The Price
     tab no longer anchors anything -- its top chart's window is pinned to the trailing
     view, because deriving it from the query is what made the tape scroll under the
     reader on every brush -- so it now has guards asserting the anchor stays *absent*.
@@ -583,7 +583,7 @@ class TestAppAnchorWiring:
     @staticmethod
     def _pair_body():
         return app_text(
-            r"def _render_best_match_pair\(.*?\n(?=def render_matches_tab)",
+            r"def _render_best_match_pair\(.*?\n(?=def _render_search_controls)",
             "_render_best_match_pair",
         )
 
@@ -690,7 +690,7 @@ class TestAppAnchorWiring:
             "the matched ticker's own pipeline must be built and used; otherwise the "
             "lower chart draws the query ticker's tape at the match's coordinates"
         )
-        assert "render_matches_tab(match_pipe," in body, (
+        assert "_render_best_match_pair(" in body, (
             "the match panel must be rendered from the matched ticker's pipeline"
         )
 
@@ -732,21 +732,19 @@ class TestAppAnchorWiring:
             "passing a view range through empties the match panel -- it is an absolute "
             "bar range, not a width"
         )
-        assert "compact=True" in body, (
-            "the Price tab draws the match through the compact branch, not the "
-            "full Matches tab"
+        assert "show_query=False" in body, (
+            "the Price tab draws the match without redrawing the query"
         )
 
     def test_price_tab_draws_the_match_without_redrawing_the_query(self):
         """The Price tab's first chart *is* the query, so the match block must not repeat it."""
-        branch = app_block(r"if compact:\n(.*?)\n        return",
-                           "compact branch")
-        assert "show_query=False" in branch, (
-            "the compact branch redraws the query, which the price chart above already "
+        body = price_tab_body()
+        assert "show_query=False" in body, (
+            "the match block redraws the query, which the price chart above already "
             "shows -- pass show_query=False"
         )
-        assert "compact=True" in price_tab_body(), (
-            "Price tab no longer renders the compact block"
+        assert "_render_best_match_pair(" in body, (
+            "the Price tab draws the match through _render_best_match_pair"
         )
 
     def test_price_tab_uses_one_height_for_both_charts(self):
@@ -773,13 +771,13 @@ class TestAppAnchorWiring:
 # build_shape_figure -- subplot geometry
 # --------------------------------------------------------------------------- #
 class TestShapeFigureGeometry:
-    """The Matches tab's per-match overlay must build a valid figure.
+    """The per-match overlay must build a valid figure.
 
     ``make_subplots`` requires ``len(row_heights) == rows`` exactly and raises
     otherwise.  This function derived its row count from ``FEATURE_COLUMNS`` but wrote
     ``heights`` as a literal sliced to fit, so the two could disagree -- and when a
     channel was removed the running server kept its wider matrix in memory
-    against a shorter list, which took the whole Matches tab down with a message about
+    against a shorter list, which took the whole page down with a message about
     subplot geometry that named neither the cause nor the fix.
     """
 

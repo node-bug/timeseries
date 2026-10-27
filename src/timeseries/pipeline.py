@@ -74,6 +74,11 @@ def normalize_bars(df: pd.DataFrame) -> pd.DataFrame:
     disagreeing about what a duplicate timestamp means.
     """
     df = df.copy()
+    if df.columns.empty or "timestamp" not in df.columns:
+        # An empty or schema-less frame (e.g. Yahoo returned no bars) has nothing
+        # to clean.  Return an empty frame with the expected schema so callers can
+        # check len() and degrade gracefully instead of raising KeyError.
+        return pd.DataFrame(columns=["timestamp", *OHLCV])
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     df = df.loc[df["timestamp"].notna()].copy()
     df = df.sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)

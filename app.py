@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 
 # --- make ``src/`` importable before anything from the package is pulled in ------- #
@@ -328,12 +329,12 @@ def stamp_labels(timestamps: Any, *, key: object = None) -> List[str]:
         # stamped at the Eastern open, and any other hour of the same session is
         # the same date.  ``session_et`` is the one definition of that date, so it
         # is what this calls.
-        dates = session_et(series).dt.strftime("%Y-%m-%d")
+        dates = session_et(series).dt.strftime("%B %-d, %Y")
     else:
         # Intraday: the bar's own instant, converted into the reader's zone.
         # ``tz_convert`` on a UTC series is the same conversion :func:`stamp_label`
         # performs on a single bar.
-        dates = series.dt.tz_convert(zone).dt.strftime("%Y-%m-%d %H:%M")
+        dates = series.dt.tz_convert(zone).dt.strftime("%B %-d, %Y %H:%M")
 
     labels = [str(v) for v in dates]
     # ``NaT`` stringifies to ``"nan"``; :func:`stamp_label` prints ``"—"`` for a
@@ -517,6 +518,8 @@ def active_projection_bounds() -> tuple:
     floor is a chart-drawing rule and the ceiling is a correction's premise.
     """
     tf = _tf()
+    if tf.key == "1d":
+        return 50, 500
     low = max(1, FORECAST_MIN_PROJECTION_BARS)
     # ``bars_per_session`` is 1 on daily, where it means "one bar is one session" --
     # so it is not a horizon ceiling and must not be read as one.
@@ -741,8 +744,7 @@ DEFAULT_SYMBOL = "BTC-USD"
 #     query before scoring, plus the same margin for NMS spacing between accepted
 #     matches.  On a ~8k-bar archive that removes ~6% of the tape twice over, so the
 #     percentile is measured against a visibly coarser field -- which is the honest
-#     cost of asking a more specific question, and the reason the Matches tab is the
-#     one to read rather than the raw distance.
+#     cost of asking a more specific question.
 #   * ``Pipeline.from_frame`` refuses to build below ``length + 100`` bars, so a
 #     thin archive that was fine at 20 bars now reports "not ready" instead of
 #     matching.  That is the intended behaviour -- a 240-bar window over a
@@ -827,17 +829,11 @@ def forecast_projection_bars() -> int:
 # :func:`active_recent_bounds` are snapped on the way in.
 FORECAST_RECENT_STEP = 30
 
-# Matches aggregated into the path.  Fixed, and deliberately **not** the sidebar's
-# ``k matches``: that control governs the horizon table below, whose sample is judged
-# against ``Min matches for evidence``.  Binding both to one slider would make a
-# control labelled "how many matches" silently decide two unrelated analyses, and a
-# reader lowering ``k`` to 10 to inspect one horizon would quietly thin the chart too.
-#
-# 30 rather than a round 20 or 50 because it is the same figure the rest of this
-# package treats as the floor for a claim (§E, ``MIN_MATCHES``).  Reusing it means the
-# chart and the table never disagree about what counts as evidence, and a reader who
-# raises ``k`` in the sidebar and finds the chart still at 30 is looking at a fixed
-# reference rather than at a broken one.
+# Matches aggregated into the path.  Fixed at 30, which is the same figure the rest
+# of this package treats as the floor for a claim (§E, ``MIN_MATCHES``).  Reusing it
+# means the chart and the table never disagree about what counts as evidence, and a
+# reader who raises ``k`` in the sidebar and finds the chart still at 30 is looking
+# at a fixed reference rather than at a broken one.
 FORECAST_PATH_MATCHES = 30
 
 # Floor for the *Projection bars* control, in bars.  1 rather than 0 because a
@@ -958,9 +954,9 @@ def forecast_selection_key() -> str:
 
 # Session keys for the two **independent** searches.
 #
-# One pair per tab because the tabs no longer share a result.  The Matches tab
-# searches the window brushed on *Price*; *Forecast* searches the window brushed on
-# itself.  Before the split, ``main()`` computed a single ``pipe.run()`` and
+# One pair per tab because the tabs no longer share a result.  *Forecast* searches
+# the window brushed on itself.  Before the split, ``main()`` computed a single
+# ``pipe.run()`` and
 # handed the same dict to both, which meant one tab could only ever report the other
 # tab's window -- and a brush on Forecast moved the evidence table on a tab whose own
 # chart showed a different moment.
@@ -976,18 +972,8 @@ def forecast_selection_key() -> str:
 # Keying on the span is what makes "moved" mean "is a new gesture" rather than "is
 # still set".  Recorded **resolved**, never raw, or a clamped brush disagrees with it
 # on every rerun and re-fires forever.
-PRICE_RUN_KEY = "run_price"
-PRICE_APPLIED_KEY = "price_applied_span"
 FORECAST_RUN_KEY = "run_forecast"
 FORECAST_APPLIED_KEY = "forecast_applied_span"
-
-
-def price_run_key() -> str:
-    return state_key(PRICE_RUN_KEY)
-
-
-def price_applied_key() -> str:
-    return state_key(PRICE_APPLIED_KEY)
 
 
 def forecast_run_key() -> str:
@@ -1036,7 +1022,7 @@ def forecast_applied_key() -> str:
 # **One ticker, one scope.**  The Forecast tab used to carry its own ticker, its own
 # pipeline and its own search, so a reader could leave the price tape on QQQ while the
 # forecast asked the same question of AAPL.  That independence is gone: the ticker input
-# now lives in the sidebar, there is exactly one, and every tab -- Price, Matches,
+# now lives in the sidebar, there is exactly one, and every tab -- Price,
 # Projection, Forecast, Quality and Backtest -- is built from the same archive.
 #
 # The three keys are not redundant: one is durable state and two are widgets.  See the
@@ -1099,7 +1085,7 @@ FETCH_RESULTS: Dict[str, Any] = {}
 # and is bumped separately below rather than cleared here.
 STALE_KEYS: Tuple[str, ...] = (
     "run_signature", "run_output", "sel", PRICE_BRUSH_KEY,
-    "applied_query_span", PRICE_RUN_KEY, PRICE_APPLIED_KEY,
+    "applied_query_span",
     FORECAST_SELECTION_KEY, FORECAST_BRUSH_KEY,
     FORECAST_RUN_KEY, FORECAST_APPLIED_KEY,
 )
@@ -1120,7 +1106,7 @@ CHANNEL_LABELS = FEATURE_COLUMNS
 # There is no separate *Chart* tab.  It used to hold the session dropdown, the From/To
 # pickers and the "Check your selection" diagnostics -- but the one gesture that
 # actually picks a window is the brush on the Price tab's own chart, and it was already
-# live there and already drove Matches and Forecast directly.  Splitting "pick the
+# live there and already drove Forecast directly.  Splitting "pick the
 # window" onto a second tab meant the reader brushed on the tab they were looking at
 # and then had to switch tabs to read what they had picked.
 #
@@ -1176,7 +1162,7 @@ CHANNEL_LABELS = FEATURE_COLUMNS
 #: contents.  What it is not safe against is changing the *number of charts rendered
 #: before* a given one -- which is why the position above is pinned rather than
 #: chosen.
-TAB_ORDER = ("Price", "Matches", "Projection", "Forecast", "Live",
+TAB_ORDER = ("Scan", "Price", "Projection", "Forecast", "Live",
              "Panel", "Quality", "Backtest")
 
 # How much tape the Price tab shows, in trading sessions.
@@ -1204,7 +1190,9 @@ DEFAULT_VIEW_DAYS = 5
 # fall out of tuple order.  Streamlit falls back to the first tab when ``default`` is
 # ``None``, which means a reordering of ``TAB_ORDER`` would silently change the
 # landing view and break that promise with nothing in the diff to explain it.
-DEFAULT_TAB = "Live"
+def get_default_tab() -> str:
+    return "Scan"
+
 
 # ``st.tabs`` only *registers a widget* -- and only reads its selection from
 # ``session_state`` -- when ``on_change`` is passed (Streamlit sets
@@ -1269,9 +1257,7 @@ TAB_GUIDE: Dict[str, str] = {
         "ticker you are looking at. Drag a box and the app asks \"has anything in "
         "the index done this?\", so the chart below is frequently a *different "
         "company's* tape — the caption above it names which one, along with the "
-        "session and how rare that window is. If you wanted the narrower question, "
-        "\"when has **this one ticker** done this?\", use the *Matches* tab, which "
-        "still searches the fetched symbol's own history.\n\n"
+        "session and how rare that window is.\n\n"
         "Two things follow, and both are why the caption exists. A window can never "
         "span two tickers — each is scored as its own contiguous series — and the "
         "percentile is measured against every window in the panel, so a quiet "
@@ -1299,8 +1285,7 @@ TAB_GUIDE: Dict[str, str] = {
         "**How the query is chosen.** The app opens on the most recent [[LENGTH]] bars of "
         "tape, over a fixed view of the last five trading sessions. To ask about "
         "another moment, **drag a box across the top chart** — a brush of N bars is "
-        "searched as N bars, and the *Matches* tab follows on the same click. That "
-        "brush is the only window control in the app.\n\n"
+        "searched as N bars. That brush is the only window control in the app.\n\n"
         "**The tape does not move when you brush.** The top chart's view is fixed, so "
         "the same bars stay at the same place on screen however many windows you try. "
         "Only the orange band moves — to where you drew it. That sounds obvious, and "
@@ -1321,16 +1306,14 @@ TAB_GUIDE: Dict[str, str] = {
         "version is handled for you: candidates whose *forward horizon* would run "
         "across a close are withheld from the match pool, because those report an "
         "overnight gap as if it were trading and inflate their measured return around "
-        "20× (§BX). The Matches tab reports how many were withheld. Where your own "
-        "query sits is your call.\n\n"
+        "20× (§BX). Where your own query sits is your call.\n\n"
         "**Why the query is exactly the length you drew.** The matcher scores your "
         "window against every window of the *same* length in the archive, so nothing is "
         "padded, trimmed or rounded onto a fixed grid.\n\n"
         "**Tips**\n\n"
         "* A bigger window is not a better window. The default [[LENGTH]] bars is only "
         "one reading of this tape — a much shorter brush is microstructure, and at that "
-        "length similarity is easier to find by accident. Compare lengths on the "
-        "*percentile* in the Matches tab, not on the raw distance.\n"
+        "length similarity is easier to find by accident.\n"
         "* If the band on the chart does not sit exactly where you drew it, that is the "
         "archive running out rather than the drag failing — a window that would "
         "overhang the final bar is shifted inward, keeping the length you drew (§Z1).\n"
@@ -1340,93 +1323,7 @@ TAB_GUIDE: Dict[str, str] = {
         "zoom would silently break that. To move along the tape, **drag the lower "
         "chart** — it is pannable and stops at its bounds — or brush a new window "
         "on the top one.\n\n"
-        "**Next:** read the *Matches* tab, which searches this window; or press "
-        "**Run match** in its own *Search settings*."
-    ),
-    "Matches": (
-        "### 2. Read which historical windows look like your query\n\n"
-        "This tab answers *\"when has something like this happened before?\"* — a "
-        "question about **examples**, not about money. Treat it as intuition-building.\n\n"
-        "**The three-stage funnel** (PLAN.md §C)\n\n"
-        "```\n"
-        "Stage 1  STUMPY matrix-profile scan over every candidate window\n"
-        "   ↓  one compiled pass, every bar position scored\n"
-        "Stage 2  rank by distance — STUMPY returns the whole profile,\n"
-        "         so there is no separate \"precise scoring\" stage to disagree\n"
-        "   ↓\n"
-        "Stage 3  drop self-overlaps, then force ≥ one window-length of spacing\n"
-        "   ↓\n"
-        "k most similar windows, at least [[LENGTH]] bars apart\n"
-        "```\n\n"
-        "Stage 1 is the workhorse. It is a **matrix profile** (§S) computed by "
-        "[STUMPY](https://github.com/stumpy-dev/stumpy): one compiled pass returns "
-        "the distance from the query to every window in the archive, which is why "
-        "the scan is fast enough to run on every keystroke. The same pass also "
-        "identifies the *least* similar windows — the anomalies — for free.\n\n"
-        "**There is no method selector, deliberately.** STUMPY's normalized distance "
-        "*is* the Euclidean distance between z-scored windows, so it is the same "
-        "ranking a plain scan would produce, just computed far more cheaply. A second "
-        "scorer would only be a slower route to the same answer — or, as with the old "
-        "time-warped option, a genuinely different metric whose percentile cannot be "
-        "ranked against this distribution at all (§BD).\n\n"
-        "**The counters at the top, left to right**\n\n"
-        "| Counter | Meaning | Read it as |\n"
-        "|---|---|---|\n"
-        "| candidate windows | how many [[LENGTH]]-bar windows exist in the archive | "
-        "bigger N ⇒ harder to be surprised |\n"
-        "| excluded | windows removed because they **overlap your query** | these are "
-        "suppressed so the query cannot match itself at distance ≈ 0 |\n"
-        "| after NMS | how many survived suppression, capped at your **k** | each is at "
-        "least [[LENGTH]] bars from the last, so they are genuinely separate moments |\n\n"
-        "**Reading the table**\n\n"
-        "* **distance** — lower is more similar. It is a raw geometric distance on "
-        "z-scored features, so it has no units and is **not** comparable across "
-        "different window lengths or different queries. Never read it as \"distance "
-        "from the truth\".\n"
-        "* **percentile** — the honest number. It is the share of every candidate "
-        "window whose distance was *at least as small*: `0.11%` means only 11 in "
-        "10,000 windows in the whole archive resemble your query this closely. Read "
-        "this, not `distance`. (PLAN.md §E)\n"
-        "* **bars** — always [[LENGTH]]. If it ever is not, that is a bug, and the "
-        "forward returns would be measured from the wrong bar (§Z1).\n\n"
-        "**Shape comparison, one tab per match**\n\n"
-        "The three closest matches appear as three tabs under the table. Each tab "
-        "shows the real tape twice: your query on top, the matched window below, both "
-        "drawn the same way as the query chart above and both rebased to their own first bar so two "
-        "different price levels land on one scale.\n\n"
-        "The shaded band is the scored window. The bars to its left are what led into "
-        "it; the bars to its right are what followed it. The dashed vertical line is "
-        "the first bar *after* the window — the bar forward returns are measured from "
-        "(§Z1).\n\n"
-        "The tape charts above and the z-scored overlay below are allowed to "
-        "disagree. The matcher scores `return_z` and `path_z`, not raw price level, "
-        "so a match can trace the feature shape while its close price looks nothing "
-        "like yours. When the two views disagree, the machine view is the one that "
-        "produced the distance.\n\n"
-        "These two panels put their bars side by side on a bar-index axis, which is "
-        "what makes a multi-session shape line up. That means the horizontal axis is no "
-        "longer proportional to time, so a gap between two bars does not tell you how "
-        "long the market was shut — read the tick labels for that.\n\n"
-        "In that overlay the two curves are **deliberately not symmetric**, and that "
-        "matters:\n\n"
-        "* the **query** (orange) is z-scored over its own span, so it is centred at 0;\n"
-        "* the **match** (blue, dashed) is the raw feature slice the library actually "
-        "scored, not re-normalised.\n\n"
-        "Re-normalising both would draw a prettier, tighter pair of curves that **do "
-        "not reproduce the distance in the table**. The visible offset between them is "
-        "the distance you are being shown. (PLAN.md §BC)\n\n"
-        "**The percentile is always populated.** Because the distance metric is fixed, "
-        "every match has a rank against a distribution measured the same way. (An "
-        "earlier version also offered a time-warped distance whose percentile was "
-        "honestly reported as `—`; that option is gone, so the column no longer has "
-        "a blank state. §BD)\n\n"
-        "**A very low percentile is not automatically a good result.** The percentile is "
-        "the share of candidates at least as close, so with thousands of windows "
-        "searched even a mediocre best-match lands near zero. Treat it as a ranking, "
-        "not a probability: compare the same query across window lengths and prefer "
-        "one that stays rare at [[LENGTH]] bars or above.\n\n"
-        "**Next:** the *Projection* tab is the fixed reference, and *Forecast* is "
-        "where a window you drew is turned into a number."
+        "**Next:** press **Run match** in its own *Search settings*."
     ),
     "Projection": (
         "### 3. A fixed reference: what usually happened next\n\n"
@@ -1503,11 +1400,10 @@ TAB_GUIDE: Dict[str, str] = {
         "tape on QQQ while the forecast asks the same question of AAPL. Switching "
         "either tab's ticker leaves the other tab's tape, brush and results alone.\n\n"
         "*Its own window* — every number on this tab describes **the window you brush "
-        "here**, and nothing else. Brushing on the *Price* tab does not move this tab: "
-        "it aims the *Matches* search, which is a different question. There is **no "
-        "default window** and no fallback to the archive's newest bars — matches near "
-        "the end have no forward bars, so a silent fallback would reliably produce the "
-        "least informative answer the tab can give.\n\n"
+        "here**, and nothing else. Brushing on the *Price* tab does not move this tab. "
+        "There is **no default window** and no fallback to the archive's newest bars — "
+        "windows near the end have no forward bars, so a silent fallback would reliably "
+        "produce the least informative answer the tab can give.\n\n"
         "The evidence table needs both that window and a run of **this** tab's *Search "
         "settings*. Until then it says which of the two is missing rather than showing "
         "numbers for a window you did not choose.\n\n"
@@ -1829,143 +1725,6 @@ def guide(key: str) -> None:
         st.markdown(fill_tokens(text))
 
 
-HELP_DIALOG_TITLE = "How to use this app"
-
-
-@st.dialog(HELP_DIALOG_TITLE, width="large")
-def help_dialog() -> None:
-    """The full operator manual, reachable from anywhere in the app."""
-    st.markdown(fill_tokens(
-        "This app searches a [[SYMBOL]] [[TIMEFRAME]] archive for historical windows "
-        "shaped like a window you pick, then measures what happened after each of "
-        "those windows.\n\n"
-        "It is built to be hard to fool. Three rules are load-bearing and are visible "
-        "everywhere in the interface:"
-    ))
-    st.markdown(fill_tokens(
-        "1. **A forecast is never shown without its random-window baseline beside "
-        "it.** If the matched average does not beat the same statistic over randomly "
-        "chosen windows, it is not a forecast.\n"
-        "2. **A forecast is suppressed entirely when the sample cannot support it** "
-        "— fewer than *Min matches for evidence* valid windows. No number is printed, "
-        "not even greyed out.\n"
-        "3. **A query is exactly the window you drew.** The matcher compares your span "
-        "against windows of the same length, and the forward returns, the baseline and "
-        "the bootstrap all use that same length — so a number on the Forecast tab "
-        "always describes the window shown on the chart."
-    ))
-
-    st.divider()
-    st.markdown("#### The workflow")
-    st.markdown(fill_tokens(
-        ""| # | Tab | What you do there |\n"
-        "|---|---|---|\n"
-        "| 1 | **Price** | The tape. Your query on top, its closest match anywhere in "
-        "the S&P 500 archive below, and the only control that picks a window — brush "
-        "it. This is where the app opens |\n"
-        "| 2 | **Matches** | The same question asked of *this ticker's own* history: "
-        "every window that traces the same shape, and how unusual that is |\n"
-        "| 3 | **Projection** | A fixed reference: where the archive's own most recent bars "
-        "usually went next, answered the same way every time. Takes no reader input, "
-        "and carries the **Projection bars** control both projections share |\n"
-        "| 4 | **Forecast** | Read what followed a window **you** drew, always against a "
-        "random-window baseline. It has its **own ticker input** at the top of the "
-        "tab, so it can forecast a different company than the tape on *Price* |\n"
-        "| 5 | **Progression** | The same question asked at fifty lookbacks: what "
-        "usually followed this tape, and does the answer change with how much history "
-        "you look back? All fifty projections are drawn on one chart |\n"
-        "| 6 | **Panel** | A cross-sectional search you drive yourself — pick the "
-        "ticker and window, then see every analogue in the index with three ranks |\n"
-        "| 7 | **Quality** | Confirm the underlying bars are sound |\n"
-        "| 8 | **Backtest** | Test out-of-sample whether any of it beats a coin flip |\n\n"
-        "A 60-second tour:\n\n"
-        "1. Leave the ticker boxes at their defaults — the app opens on the newest window, "
-        "over the last five trading sessions. Both boxes sit at the **top of the "
-        "page**; **Forecast** starts on the same ticker, and gives it a different one "
-        "whenever you want to compare two companies.\n"
-        "2. Press **Run match** on the tab you are reading.\n"
-        "3. Open **Matches**. Read the *percentile* column, not the distance column.\n"
-        "4. Open **Forecast**, brush a window, and compare the green bar to the grey "
-        "bar. If the row is grey, no evidence exists — raise **k matches**.\n"
-        "5. Open **Backtest** and press **Run backtest** for the honest verdict.\n\n"
-        "To search an earlier moment: drag a box across the top chart on the *Price* "
-        "tab. A brush of N bars is searched as N bars, and Matches and Forecast update "
-        "on the same click.\n\n"
-        "**Two different searches, deliberately.** *Price* asks the wide question — "
-        "\"has anything in the index done this?\" — so its match is usually a different "
-        "company, and the caption says which. *Matches* and *Forecast* ask the narrow "
-        "one, about the fetched symbol's own history, because a forecast is only "
-        "meaningful against a control drawn from the same instrument. *Projection* asks "
-        "neither — it is the archive answering about itself. Use *Panel* when you want "
-        "the wide question with a forecast attached to it."
-    ))
-
-    st.divider()
-    st.markdown("#### Every sidebar control")
-    st.markdown(fill_tokens(CONTROL_GLOSSARY))
-
-    st.divider()
-    st.markdown("#### Glossary")
-    st.markdown(fill_tokens(GLOSSARY))
-
-    st.divider()
-    st.markdown("#### Common questions")
-    st.markdown(
-        "**“The Forecast tab is all grey — what do I do?”**\n"
-        "The matched set did not reach *Min matches for evidence*. In order of cost: "
-        "raise **k matches** to ≥ 30, or move the query away from the end of the archive "
-        "so more windows have a full forward horizon.\n\n"
-        "**“Why does the percentile change when I move the query?”**\n"
-        "The percentile is measured against every candidate window in the archive, so a "
-        "query sitting in a quiet stretch competes against a different field of windows "
-        "than one in a busy stretch. The *absolute* percentile matters more than the "
-        "count of matches.\n\n"
-        "**“Where do the numbers come from?”**\n"
-        "Everything on every tab comes from `src/timeseries/`. The `§` references point "
-        "into `PLAN.md`, which records the design rationale and each bug this project "
-        "has already fixed (§Z1 forward returns from the wrong bar, §Z2 infinite "
-        "volume changes, §BD removing a time-warped metric whose percentile could not be "
-        "ranked).\n\n"
-        "**“Is this trading advice?”**\n"
-        "No. It is exploratory research tooling on a single instrument's intraday "
-        "archive, with no position sizing, no execution, and no claim of edge."
-    )
-
-    st.divider()
-    st.markdown("#### How the numbers are produced")
-    st.markdown(
-        "* **Features.** Two legs per bar, both price: `return_z`, a rolling-20 z-score of "
-        "the log return, and `path_z`, the rebased log-price path itself — the line "
-        "the chart draws. Z-scoring both is what keeps the rolling return and the "
-        "drawn path on one scale.\n"
-        "* **Warm-up.** The first ~20 bars cannot have a rolling standard deviation, so "
-        "they are dropped rather than imputed. All bar indices are into this cleaned "
-        "frame.\n"
-        "* **The funnel.** A STUMPY matrix-profile scan scores every candidate window in "
-        "one compiled pass, then exclusion and suppression separate genuine matches "
-        "from the query's own neighbourhood (§C, §M).\n"
-        "* **Self-match guard.** Every window overlapping the query, plus one "
-        "window-length of margin, is removed before scoring (§M).\n"
-        "* **Forward returns.** Measured from the **last bar of the matched window** "
-        "forward — never from inside it (§Z1).\n"
-        "* **Uncertainty.** Moving-block bootstrap for intervals (matched windows "
-        "overlap in time) and a permutation test against the random baseline for "
-        "p-values.\n\n"
-        "**Is the harness itself trustworthy?** Run the placebo test — it feeds "
-        "synthetic random-walk data of the same volatility through the whole pipeline "
-        "and must find nothing:\n\n"
-        "```\n"
-        "python3 -m timeseries.placebo\n"
-        "```\n\n"
-        "If it reports significant patterns, the bug is in the measurement, not the "
-        "market. This is the single highest-value check in the project (§E) and takes "
-        "well under a minute, so run it before trusting anything on the Forecast or "
-        "Backtest tabs.\n\n"
-        "**Not trading advice.** This is exploratory research tooling built on a single "
-        "instrument's intraday archive."
-    )
-
-
 CONTROL_GLOSSARY = """
 | Control | What it does | When to change it |
 |---|---|---|
@@ -2019,7 +1778,8 @@ GLOSSARY = """
 # Caching
 # =============================================================================== #
 def fetch_ticker_cached(symbol: str, *, refresh: bool = False,
-                        timeframe: object = None) -> "F.FetchResult":
+                        timeframe: object = None,
+                        write: bool = True) -> "F.FetchResult":
     """Download every available bar for ``symbol``, reusing this session's fetch.
 
     ``@st.cache_data`` is deliberately *not* used here: a network call returns a
@@ -2065,6 +1825,11 @@ def fetch_ticker_cached(symbol: str, *, refresh: bool = False,
     write uses ``policy="flag"``: a re-fetch whose content differs from what is stored
     leaves the existing partition untouched and increments a revision count instead of
     overwriting it, so a retro-adjusted day is flagged rather than silently destroyed.
+
+    ``write=False`` skips the archive write.  The Scan tab passes it because a scan
+    is a read-only operation over hundreds of tickers: writing each fetch would
+    rewrite the daily manifest (579 MB, 4.2M rows) once per ticker, which is the
+    entire cost of a daily scan.
     """
     store = _fetch_store()
     tf = resolve_timeframe(timeframe if timeframe is not None else ACTIVE_TIMEFRAME[0])
@@ -2075,13 +1840,14 @@ def fetch_ticker_cached(symbol: str, *, refresh: bool = False,
             return hit
     result = F.fetch_ticker(symbol, days=None, timeframe=tf.key)
     store[key] = result
-    # Persist fetched bars to the partitioned Parquet archive on disk.
-    # This ensures data survives Streamlit reruns (which recreate the in-memory
-    # _fetch_store dict) and is available to other sessions/tabs.
-    panel_root = panel_root_for(timeframe)
-    PanelStore(panel_root).write(
-        symbol, result.frame, policy=MERGE_POLICY, timeframe=tf.key,
-    )
+    if write:
+        # Persist fetched bars to the partitioned Parquet archive on disk.
+        # This ensures data survives Streamlit reruns (which recreate the in-memory
+        # _fetch_store dict) and is available to other sessions/tabs.
+        panel_root = panel_root_for(timeframe)
+        PanelStore(panel_root).write(
+            symbol, result.frame, policy=MERGE_POLICY, timeframe=tf.key,
+        )
     return result
 
 
@@ -2259,6 +2025,20 @@ LIVE_PATH_KEY = "live_path"
 #: not the same forecast.
 LIVE_MATCH_KEY = "live_match"
 
+#: Session-state key for the Scan tab's pinned **anchor** -- the bar its frozen
+#: projection grows out of.
+SCAN_ANCHOR_KEY = "scan_anchor_ts"
+
+#: Session-state key for the Scan tab's pinned **history start** -- the first bar
+#: on screen.
+SCAN_HIST_START_KEY = "scan_hist_start_ts"
+
+#: Session-state key for the Scan tab's **frozen projection**.
+SCAN_PATH_KEY = "scan_path"
+
+#: Session-state key for the Scan tab's **frozen closest match**.
+SCAN_MATCH_KEY = "scan_match"
+
 
 def live_state_key(symbol: str, base: str) -> str:
     """Session-state key for one piece of Live-tab state, per symbol.
@@ -2316,6 +2096,51 @@ def live_pinned_anchor(
     if needs_pin:
         # The anchor is the archive's newest bar; the history start is
         # ``recent_bars`` earlier.  Both clamped into the frame.
+        anchor_index = pipe.n_bars - 1
+        start_index = max(0, anchor_index + 1 - n)
+        state[anchor_key] = pipe.bars["timestamp"].iloc[anchor_index]
+        state[start_key] = pipe.bars["timestamp"].iloc[start_index]
+        state[width_key] = n
+
+    return state.get(anchor_key), state.get(start_key)
+
+
+def scan_state_key(symbol: str, base: str) -> str:
+    """Session-state key for one piece of Scan-tab state, per symbol.
+
+    Mirrors :func:`live_state_key` but namespaced under ``scan_`` so the two
+    tabs never collide on session state.
+    """
+    return state_key("{}_{}".format(base, str(symbol).upper()))
+
+
+def scan_pinned_anchor(
+    pipe: Pipeline,
+    symbol: str,
+    recent_bars: int,
+) -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
+    """The Scan tab's pinned ``(anchor, history_start)``, as timestamps.
+
+    Mirrors :func:`live_pinned_anchor`.  Both values are moments, never bar
+    indices, so the pin survives archive refreshes and the frozen projection
+    stays attached to the same moment while the tape rolls past it.
+    """
+    anchor_key = scan_state_key(symbol, SCAN_ANCHOR_KEY)
+    start_key = scan_state_key(symbol, SCAN_HIST_START_KEY)
+    width_key = scan_state_key(symbol, "scan_recent_bars_width")
+    state = st.session_state
+
+    n = max(1, int(recent_bars))
+
+    if pipe is None or pipe.n_bars == 0:
+        return state.get(anchor_key), state.get(start_key)
+
+    width = state.get(width_key)
+    needs_pin = state.get(anchor_key) is None
+    if not needs_pin and width is not None and int(width) != n:
+        needs_pin = True
+
+    if needs_pin:
         anchor_index = pipe.n_bars - 1
         start_index = max(0, anchor_index + 1 - n)
         state[anchor_key] = pipe.bars["timestamp"].iloc[anchor_index]
@@ -2726,7 +2551,7 @@ def build_price_figure(pipe: Pipeline, view_start: int, view_stop: int,
     labels stay readable while the spacing between them is not proportional to time.
 
     Two optional behaviours make two *different* windows comparable by eye, which is
-    what the Matches tab needs when it draws the query above a matched window:
+    what the Price tab needs when it draws the query above a matched window:
 
     ``rebase_at``
         Divide every level by the close at that bar, turning the price axis into
@@ -2906,7 +2731,7 @@ def build_price_figure(pipe: Pipeline, view_start: int, view_stop: int,
     # across the axis and imply the bars move within a day.  See :func:`stamp_label`.
     step = max(1, (view_stop - view_start) // 8)
     ticks = list(range(view_start, view_stop, step))
-    if ticks[-1] != view_stop - 1:
+    if ticks and ticks[-1] != view_stop - 1:
         ticks.append(view_stop - 1)
     x_axis: Dict[str, Any] = dict(
         title="bar index · sessions compressed",
@@ -3471,7 +3296,7 @@ def build_shape_figure(pipe: Pipeline, query_start: int, match_start: int,
     # Derived from ``order`` rather than written out as a literal, because Plotly
     # requires ``len(row_heights) == rows`` exactly and raises otherwise.  A literal
     # sliced to ``[: len(order)]`` looks safe and is not: the moment FEATURE_COLUMNS
-    # grows past the literal it silently yields a *short* list, and the Matches tab dies
+    # grows past the literal it silently yields a *short* list, and the figure dies
     # with a message about subplot geometry that names neither the cause nor the fix.
     # Shares need not sum to 1 -- Plotly normalises by the total.
     others = max(len(order) - 1, 1)
@@ -3995,12 +3820,10 @@ def build_forecast_path_figure(
     bar the projection grows out of; ``projection_anchor + offsets`` are the
     projection's x-positions, computed once and never moved.
 
-    **The separator stands on the first bar that belongs to the projection alone.**
-    That bar is ``projection_anchor + 1``.  Offset 0 *is* the anchor -- the bar
-    history and forecast share -- so the first bar that exists only in the
-    projection is the one after it.  The line therefore marks where the
-    projected bars *begin*, rather than pointing at the real bar they grow out
-    of.  The projection's trace still starts at the anchor, because that is the
+    **The separator stands where the projection bars start.**  That bar is
+    ``projection_anchor`` -- offset 0 of the forecast path, which is the first
+    projected bar.  The line therefore marks where the projected bars *begin*.
+    The projection's trace still starts at the anchor, because that is the
     contract :func:`timeseries.forecast.forecast_paths` states: the two halves
     meet at one point rather than at two points a bar apart.
 
@@ -4074,10 +3897,10 @@ def build_forecast_path_figure(
         anchor = int(projection_anchor)
     stop = projection_anchor + int(path.horizon)
 
-    # **The separator stands on the first bar that belongs to the projection
-    # alone.**  That bar is ``anchor + 1`` -- see the docstring for why, and for
-    # why the projection's *trace* still starts on the anchor.
-    boundary = anchor + 1
+    # **The separator stands where the projection bars start.**  That bar is
+    # ``anchor`` -- offset 0 of the forecast path -- see the docstring for why,
+    # and for why the projection's *trace* still starts on the anchor.
+    boundary = anchor
 
     close = np.asarray(pipe.close, dtype=float)
     base = float(close[anchor]) if 0 <= anchor < n else float("nan")
@@ -4133,8 +3956,23 @@ def build_forecast_path_figure(
         name="interquartile range",
     ))
     # Offset labels for the projection: those bars do not exist yet, so the
-    # hover prints "+4 min" / "+4 days" rather than a clock time.
-    proj_stamps = ["+%d %s" % (o, bar_unit(o)) for o in path.offsets]
+    # hover prints the projected date rather than a bare offset.
+    anchor_ts = pd.Timestamp(pipe.bars["timestamp"].iloc[projection_anchor])
+    if _tf().key == "1m":
+        # Intraday: one bar is one minute, so the offset in bars is the offset
+        # in minutes. Print the projected clock time in the reader's zone.
+        zone = display_zone()
+        proj_stamps = [
+            (anchor_ts + pd.Timedelta(minutes=int(o))).tz_convert(zone).strftime("%B %-d, %Y %H:%M")
+            for o in path.offsets
+        ]
+    else:
+        # Daily: one bar per session, so an offset is a session count. Print
+        # the projected date (Eastern) rather than "+4 days".
+        proj_stamps = [
+            (anchor_ts + pd.Timedelta(days=int(o))).strftime("%B %-d, %Y")
+            for o in path.offsets
+        ]
     if show_median:
         fig.add_trace(go.Scatter(
             x=proj_x, y=y_median, mode="lines",
@@ -4200,9 +4038,9 @@ def build_forecast_path_figure(
 
     # The boundary, drawn before the shading so the shading does not wash it out.
     #
-    # **The line is on the first *projected* bar**, ``anchor + 1``, and it is on the
-    # *pinned* anchor's successor, so it holds still as the tape rolls.  It used to
-    # be drawn at the history's last bar, which on the *Live* tab is the archive's
+    # **The line is where the projection bars start**, ``anchor`` -- offset 0 of
+    # the forecast path -- so it holds still as the tape rolls.  It used to be
+    # drawn at the history's last bar, which on the *Live* tab is the archive's
     # newest bar -- so the line walked right with the tape and stopped meaning
     # anything.
     fig.add_vline(x=boundary, line=dict(color="rgba(128,128,128,0.9)", width=1.4,
@@ -4238,21 +4076,14 @@ def build_forecast_path_figure(
     # does not.  Either way the boundary is named once, and never twice.
     anchor_tick = projection_anchor
     history_labels_anchor = anchor_tick in ticks
-    # **Offset 0 is dropped either way.**  It sits on the anchor bar, which is
-    # always labelled -- by the history's own ticks when the history ends at
-    # the anchor, and by an explicit tick when the anchor sits *inside* a
-    # history that runs on past it (the *Live* tab, whose tape keeps rolling to
-    # the right of the frozen anchor).  Keeping offset 0 in the second case
-    # put the anchor on the axis twice, under two different spellings: the
+    # **Offset 0 is the boundary.**  It sits on the anchor bar, which is always
+    # labelled -- by the history's own ticks when the history ends at the
+    # anchor, and by an explicit tick when the anchor sits *inside* a history
+    # that runs on past it (the *Live* tab, whose tape keeps rolling to the
+    # right of the frozen anchor).  Keeping offset 0 in the second case put
+    # the anchor on the axis twice, under two different spellings: the
     # history's full timestamp and the projection's bare clock time.
     proj_offsets = [o for o in proj_ticks if o != 0]
-    # **Offset 1 is the boundary, and the boundary is always labelled.**  The
-    # tick step can skip over it -- a horizon of 20 with a step of 4 goes
-    # 0, 4, 8 ... and never names the bar the separator stands on -- so offset
-    # 1 is put back in.  An unlabelled separator is a boundary the reader
-    # cannot place, and this one is the whole point of the chart.
-    if int(path.horizon) >= 1 and 1 not in proj_offsets:
-        proj_offsets = sorted(proj_offsets + [1])
 
     # **The unit is the resolution's, not a literal.**  These offsets are *bars*, so
     # on daily a tick reads "+4 days", not "+4 min" -- one bar is one trading day there.
@@ -4267,7 +4098,6 @@ def build_forecast_path_figure(
     # was handed, not the ones the page opened on.  The *history* labels therefore come
     # from the pipeline, which is the authority on the bars actually drawn; only the
     # projected offsets, which have no pipeline behind them, use the active timeframe.
-    anchor_ts = pd.Timestamp(pipe.bars["timestamp"].iloc[projection_anchor])
 
     # **The tick values and their labels are built together**, so the two lists
     # cannot drift apart: a label is only ever emitted for a position that was
@@ -4366,8 +4196,6 @@ def build_forecast_path_figure(
 
 
 # =============================================================================== #
-# Tab: Matches
-# =============================================================================== #
 # Tails drawn either side of every scored window, in bars.  Fixed rather than a
 # slider: it is a *view* control, not an analysis one, and every extra rerunnable
 # widget is a cache-key dimension that can invalidate the whole pipeline for a
@@ -4447,12 +4275,8 @@ def _render_best_match_pair(pipe: Pipeline, query: M.Query, m: M.Match, rank: in
     centred -- doing so would need bars the archive does not have.  So the Price tab's
     two panels trade load-time band alignment for equal bar width and a match the
     reader can explore.  The bar-to-pixel scale still matches, which is what makes the
-    shapes comparable; the band offsets no longer agree.  ``pannable`` is off for the
-    Matches tab, whose three panels are meant to be read against each other at a glance
-    rather than explored one at a time.
 
-    Used by the Price tab (match only, no captions) and the Matches tab (three, one per
-    tab, query + match + captions).
+    Used by the Price tab (match only, no captions).
     """
     q_start, q_stop = query.start, query.stop
     pad = max(0, int(pad))
@@ -4566,8 +4390,8 @@ def _render_best_match_pair(pipe: Pipeline, query: M.Query, m: M.Match, rank: in
         rebase_at=None, y_range=m_y_range,
         selectable=False, height=height,
         # The three pan arguments are all ``None``/``False`` unless ``pannable`` was
-        # requested, so the Matches tab's panels -- and the Price tab's query chart --
-        # build exactly the figure they built before panning existed.
+        # requested, so the Price tab's query chart --
+        # build exactly the figure it built before panning existed.
         pan_data=m_pan_data, pan_bounds=m_pan_bounds, pannable=pannable,
     )
     if pannable:
@@ -4716,7 +4540,7 @@ def render_live_tab(pipe: Pipeline, symbol: str, *,
     projection_bars = st.slider(
         "Projection bars",
         min_value=10, max_value=600,
-        step=50, value=10,
+        step=50, value=40,
         help="How many bars into the future to project the historical match.",
         key="live_projection_bars_slider",
     )
@@ -4923,6 +4747,318 @@ def render_live_tab(pipe: Pipeline, symbol: str, *,
                 "table with the reason."
             )
     _live_poll_fragment()
+
+
+# =============================================================================== #
+# Scan tab
+# =============================================================================== #
+#: Default number of recent bars used as the pattern on the Scan tab.
+SCAN_DEFAULT_RECENT_BARS = 10
+#: Default number of projection bars on the Scan tab.
+SCAN_DEFAULT_PROJECTION_BARS = 40
+#: How many tickers the Scan tab shows (top-ranked).
+SCAN_TOP_COUNT = 10
+
+
+def _scan_tickers() -> List[str]:
+    """Every ticker present in the panel archive for the active resolution.
+
+    Read from the on-disk Parquet archive rather than re-downloading each name,
+    so a scan is cheap and works offline once the archive is built.
+    """
+    root = panel_root_for(_tf())
+    store = PanelStore(root)
+    return store.tickers()
+
+
+def _scan_one_ticker(
+    ticker: str,
+    recent_bars: int,
+    projection_bars: int,
+    amplitude_weight: float,
+) -> Optional[Tuple[str, Any, Pipeline]]:
+    """Build a forecast path for one ticker, or ``None`` if it cannot be scored.
+
+    Returns ``(ticker, path, pipe)`` so the caller can rank and chart.
+
+    **Always fetches fresh Yahoo data** (``refresh=True``) so each poll picks
+    up newly arrived tape bars, exactly as the Live tab does.  The fetch is
+    read-only (``write=False``): a scan must not rewrite the archive, because
+    on daily each write rewrites the 579 MB manifest once per ticker.
+    """
+    tf = _tf()
+    try:
+        bars = fetch_ticker_cached(ticker, refresh=True, timeframe=tf.key,
+                                   write=False)
+        frame = bars.frame
+    except Exception:  # noqa: BLE001 - skip tickers that fail to load
+        return None
+
+    scan_pipe = pipeline_from_frame(
+        "scan_{}@{}".format(ticker, tf.key),
+        frame,
+        active_length(),
+        timeframe=tf,
+    )
+
+    if scan_pipe is None or not scan_pipe.ready or scan_pipe.n_bars < recent_bars:
+        return None
+
+    path = forecast_path_for(
+        cache_key="scan_{}_{}_{}_{}".format(ticker, recent_bars, projection_bars,
+                                            _tf().key),
+        pipe=scan_pipe,
+        length=recent_bars,
+        horizon=projection_bars,
+        k=1,
+        amplitude_weight=amplitude_weight,
+        window=None,
+    )
+
+    if path is None:
+        return None
+
+    return ticker, path, scan_pipe
+
+
+def render_scan_tab(pipe: Pipeline, symbol: str, *,
+                    amplitude_weight: float = M.DEFAULT_AMPLITUDE_WEIGHT) -> None:
+    """The **Scan** tab: live-style projection chart for the top ticker.
+
+    Scans every ticker in the panel archive, matches the most recent
+    ``recent_bars`` bars against each one's history, projects ``projection_bars``
+    ahead, and ranks the results by closest match distance.  The top ticker is
+    charted.
+
+    One pair of sliders governs every chart, so the same window length and
+    horizon are applied to every ticker during the scan.
+
+    **The scan runs only when the reader presses Scan.**  After that, the
+    fragment auto-refreshes every 60 seconds but only re-fetches the tape for
+    the already-selected top ticker and redraws its chart -- it never re-scans
+    all tickers again.  The anchor and history start are pinned as *moments*
+    (timestamps), not bar indices, so the existing tape stays put while new
+    bars append to the right.  The projection and its closest match are frozen
+    as values computed once against the pinned window, so every poll draws the
+    same forecast while the blue tape grows past it.
+    """
+    st.subheader("Scan — top tickers by closest match distance")
+
+    # One pair of sliders, shared by every chart in the scan.
+    col_recent, col_proj = st.columns([2, 2])
+    with col_recent:
+        recent_bars = st.slider(
+            "Recent bars",
+            min_value=10, max_value=600,
+            step=10, value=SCAN_DEFAULT_RECENT_BARS,
+            key="scan_recent_bars",
+            help="How many of the most recent bars to use as the pattern to match, "
+                 "applied to every ticker in the scan.",
+        )
+    with col_proj:
+        projection_bars = st.slider(
+            "Projection bars",
+            min_value=10, max_value=600,
+            step=10, value=SCAN_DEFAULT_PROJECTION_BARS,
+            key="scan_projection_bars",
+            help="How many bars into the future to project the historical match, "
+                 "applied to every ticker in the scan.",
+        )
+
+    # **The pinned moments are resolved against the *current* pipeline.**  They
+    # are moments, so this is the same bar every time -- but the index it lands
+    # on is not, which is exactly why the moment is what was stored.
+    anchor_ts, hist_start_ts = scan_pinned_anchor(pipe, symbol, recent_bars)
+
+    @st.fragment(run_every=60)
+    def _scan_poll_fragment() -> None:
+        # The full scan across all tickers runs only when the reader clicks Scan.
+        # Auto-refresh polls just re-fetch the tape for each already-selected
+        # top ticker and redraw its chart.
+        if not st.button("Scan", key="scan_button", type="primary"):
+            # No scan has been run yet (or the reader changed a control and the
+            # fragment re-ran without a click).  Show any previously scanned
+            # tickers' charts so the tapes keep rolling, but do not start a new
+            # scan.
+            tickers = st.session_state.get("scan_top_tickers") or []
+            if tickers:
+                for ticker in tickers:
+                    _draw_scan_chart(recent_bars, projection_bars, amplitude_weight,
+                                     anchor_ts, hist_start_ts, force_rescan=False,
+                                     ticker=ticker)
+            else:
+                _draw_scan_chart(recent_bars, projection_bars, amplitude_weight,
+                                 anchor_ts, hist_start_ts, force_rescan=False)
+            return
+
+        tickers = _scan_tickers()
+        st.caption("Scanning {} tickers from the panel archive…".format(len(tickers)))
+
+        scored: List[Tuple[str, Any, Pipeline]] = []
+        with st.spinner("Matching {} bars and projecting {} ahead across {} tickers…".format(
+                recent_bars, projection_bars, len(tickers))):
+            # Parallel: each ticker is an independent fetch + match, so run them
+            # concurrently.  ``fetch_ticker_cached`` and ``pipeline_from_frame`` are
+            # process-wide caches, and Numba's OpenMP layer (preloaded by
+            # ``timeseries._threading``) is threadsafe, so concurrent scoring is safe.
+            with ThreadPoolExecutor(max_workers=64) as pool:
+                futures = {
+                    pool.submit(_scan_one_ticker, ticker, recent_bars,
+                                projection_bars, amplitude_weight): ticker
+                    for ticker in tickers
+                }
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result is not None:
+                        scored.append(result)
+
+        # Rank by closest match distance first (lower distance = tighter match),
+        # then by median projected return at the horizon (higher = stronger move),
+        # then ticker name for determinism.
+        def _rank_key(item: Tuple[str, Any, Pipeline]) -> Tuple[float, float, str]:
+            ticker, path, _pipe = item
+            distance = float(path.distances[0]) if path.distances.size else float("inf")
+            final_return = float(path.median[-1]) if path.median.size else 0.0
+            return (distance, -final_return, ticker)
+
+        scored.sort(key=_rank_key)
+        top = scored[:SCAN_TOP_COUNT]
+
+        if not top:
+            st.warning("No ticker could be scored with these settings. Try shorter "
+                       "Recent bars or a smaller Projection bars value.")
+            return
+
+        st.caption("Showing top {} of {} scored tickers, ranked by closest match "
+                   "distance (tightest first).".format(
+                       len(top), len(scored)))
+
+        # Remember all top tickers so auto-refresh can keep every tape rolling
+        # without re-scanning everything.
+        st.session_state["scan_top_tickers"] = [ticker for ticker, _, _ in top]
+        st.session_state["scan_top_ticker"] = top[0][0]
+
+        for ticker, path, scan_pipe in top:
+            st.divider()
+            st.subheader("Scan — {}".format(ticker))
+            _draw_scan_chart(recent_bars, projection_bars, amplitude_weight,
+                             anchor_ts, hist_start_ts, force_rescan=True,
+                             ticker=ticker, path=path, scan_pipe=scan_pipe)
+
+    _scan_poll_fragment()
+
+
+def _draw_scan_chart(
+    recent_bars: int,
+    projection_bars: int,
+    amplitude_weight: float,
+    anchor_ts: Optional[pd.Timestamp],
+    hist_start_ts: Optional[pd.Timestamp],
+    *,
+    force_rescan: bool = False,
+    ticker: Optional[str] = None,
+    path: Any = None,
+    scan_pipe: Optional[Pipeline] = None,
+) -> None:
+    """Draw the scan chart for one ticker.
+
+    When ``force_rescan`` is False (auto-refresh poll), the ticker is read from
+    session state and only its tape is re-fetched -- the projection stays
+    frozen.  When True (just after a Scan click), the supplied path and pipe
+    are used and the projection is frozen for the first time.
+    """
+    if ticker is None:
+        ticker = st.session_state.get("scan_top_ticker")
+    if ticker is None:
+        return
+
+    # On auto-refresh polls, re-fetch just this ticker's tape so the chart
+    # rolls with new bars.  The projection itself is not recomputed.
+    if not force_rescan:
+        try:
+            bars = fetch_ticker_cached(ticker, refresh=True, timeframe=_tf().key,
+                                       write=False)
+            frame = bars.frame
+        except Exception:  # noqa: BLE001 - cannot refresh, keep showing what we have
+            frame = None
+        if frame is not None:
+            scan_pipe = pipeline_from_frame(
+                "scan_{}@{}".format(ticker, _tf().key),
+                frame,
+                active_length(),
+                timeframe=_tf(),
+            )
+        if scan_pipe is None or not scan_pipe.ready:
+            return
+
+    # **The pinned moments are resolved against the *current* pipeline.**
+    # They are moments, so this is the same bar every time -- but the index it
+    # lands on is not, which is exactly why the moment is what was stored.
+    projection_anchor = resolve_bar_index(scan_pipe, anchor_ts)
+    hist_start = resolve_bar_index(scan_pipe, hist_start_ts)
+    if projection_anchor is None or hist_start is None:
+        st.warning("The pinned starting bar is no longer in the archive.")
+        return
+
+    # **The projection is frozen: computed once, then reused.**  On a Scan
+    # click we compute and store it; on auto-refresh polls we reuse the stored
+    # path so the forecast stays identical while only the tape rolls.
+    path_key = scan_state_key(ticker, SCAN_PATH_KEY)
+    match_key = scan_state_key(ticker, SCAN_MATCH_KEY)
+    stored_path = st.session_state.get(path_key)
+    frozen_match = st.session_state.get(match_key)
+
+    if force_rescan or stored_path is None \
+            or _live_path_is_stale(stored_path, recent_bars, projection_bars) \
+            or not _frozen_match_is_usable(frozen_match, stored_path):
+        if path is None:
+            path = forecast_path_for(
+                cache_key="scan_{}_{}_{}_{}".format(ticker, recent_bars,
+                                                    projection_bars, _tf().key),
+                pipe=scan_pipe,
+                length=recent_bars,
+                horizon=projection_bars,
+                k=1,
+                amplitude_weight=amplitude_weight,
+                window=None,
+            )
+        if path is not None:
+            st.session_state[path_key] = path
+            st.session_state[match_key] = _freeze_closest_match(
+                scan_pipe.close, path)
+        else:
+            st.session_state.pop(path_key, None)
+            st.session_state.pop(match_key, None)
+        stored_path = st.session_state.get(path_key)
+        frozen_match = st.session_state.get(match_key)
+
+    if stored_path is None:
+        st.warning("Could not find a matching historical pattern for "
+                   "the current price action.")
+        return
+
+    # Build the figure with the refreshed pipeline.
+    #
+    # **The history runs from the pinned start to the end of the archive**, so
+    # the tape grows to the right as new bars arrive while the left edge stays
+    # on the pinned bar.
+    #
+    # **The frozen series is handed over with the path**, so the orange trace
+    # is drawn as it was captured rather than re-read from the archive that has
+    # since rolled.
+    fig = build_forecast_path_figure(
+        scan_pipe,
+        stored_path,
+        history_bars=recent_bars,
+        title="Scan — %s" % ticker,
+        show_median=False,
+        projection_anchor=projection_anchor,
+        hist_start=hist_start,
+        hist_stop=scan_pipe.n_bars,
+        frozen_match=frozen_match,
+    )
+    st.plotly_chart(fig, width='stretch', key="scan_chart_{}".format(ticker),
+                    config=chart_config())
 
 
 # --------------------------------------------------------------------------- #
@@ -5230,251 +5366,6 @@ def _render_progression_table(sweep: ProgressionSweep, horizon: int) -> None:
     st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
 
 
-def render_matches_tab(pipe: Pipeline, result: M.MatchResult,
-                       *, compact: bool = False,
-                       pad: int = CONTEXT_BARS,
-                       chart_width: Optional[int] = None,
-                       anchor: Optional[int] = None,
-                       pannable: bool = False,
-                       height: int = 420) -> None:
-    query = result.query
-    # Widget keys are namespaced by where this block renders, because the Price tab
-    # and the Matches tab can both draw it in the same rerun and Streamlit rejects a
-    # duplicate key outright.
-    scope = "price" if compact else "tab"
-
-    # Compact mode is the Price tab's answer to "when has something like this looked
-    # like this?".  It is the full-tape price chart above, then the single closest
-    # historical match below it -- and nothing else: no metrics, no table, no captions,
-    # no shape overlay, no hint text.  The query is not redrawn here, because the chart
-    # immediately above *is* the query.  Every statistic stripped from this block lives
-    # on the Matches tab, where there is room to read it.
-    #
-    # ``chart_width`` carries the query chart's bar width down from the Price tab so the
-    # match below is drawn at the same scale.  It is a width rather than a view range
-    # because a view is absolute: the match panel re-centres a window of this width on
-    # its own band, which keeps the match visible and the two scales identical.
-    if compact:
-        if not result.matches:
-            # Silence, not a caption.  This block's contract is the two charts and
-            # nothing else, and "no match survived" is a sentence in a place that has
-            # no sentences.  It is also not lost: the Matches tab reports the empty
-            # case properly, with the two metrics that explain *why* the field is
-            # empty (candidate windows, excluded overlaps) and what to do about it.
-            # A lone line here used to be the only explanation the Price tab gave,
-            # which is worse than none -- it named the outcome without the cause.
-            return
-        _render_best_match_pair(
-            pipe, query, result.matches[0], 1, pad=pad,
-            scope=scope, show_query=False, chart_width=chart_width,
-            anchor=anchor, pannable=pannable, height=height,
-        )
-        return
-
-    st.subheader("Matches")
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric(
-        "candidate windows", "{:,}".format(result.n_candidates),
-        help="Every {}-bar window the matcher could have compared against, across "
-             "the whole archive. This is the denominator behind the percentile: a "
-             "match has to be rarer than all but this many windows to look unusual."
-             .format(pipe.length),
-    )
-    c2.metric(
-        "excluded (self/overlap)", "{:,}".format(result.n_excluded),
-        help="Candidates removed before scoring, for **both** reasons: they overlap "
-             "the query span plus one window-length of margin (§M), or their forward "
-             "horizon would cross a session closure (§BX). It is the total, so it is "
-             "what the percentile denominator is built from.",
-    )
-    c3.metric(
-        "after NMS", "{:,}".format(result.n_after_nms),
-        help="Matches surviving non-maximum suppression: each is at least one "
-             "window-length ({}) from the last, so overlapping windows cannot "
-             "masquerade as separate evidence.".format(pipe.length),
-    )
-    # The old fourth tile reported the scoring method.  With one scorer that was a
-    # constant, so it is replaced by the number the module actually exists to report:
-    # how rare the best match is (§E).
-    best_pct = result.matches[0].percentile if result.matches else float("nan")
-    c4.metric(
-        "best percentile", pct(best_pct),
-        help="How rare the closest match is: the share of every searchable candidate "
-             "window whose distance was at least as small (§E). This is the honest "
-             "score — the raw distance is not comparable across window lengths.",
-    )
-
-    if getattr(result, "n_masked", 0):
-        st.caption(
-            "§BX — {:,} of {:,} candidate windows were withheld because their "
-            "forward horizon would run across a session closure. A window ending on a "
-            "session's last bar reports the **overnight gap** as if it were trading, "
-            "which inflated its forward return about 20× on the QQQ archive. "
-            "Windows that merely *straddle* a closure are kept: that bar's move is "
-            "real, it is simply unusual, and dropping every such window would cost "
-            "31% of the pool at 60 bars."
-            .format(result.n_masked, result.n_candidates)
-        )
-
-    hint(
-        "Every candidate overlapping the query span plus one window-length of margin "
-        "is removed before scoring (§M), as is any candidate whose forward horizon "
-        "would span a session closure (§BX). Remaining matches are forced at least "
-        "one window-length apart, so they are temporally independent rather than the "
-        "same minute counted several times."
-    )
-
-    if not result.matches:
-        st.warning("No matches survived. The series may be shorter than the exclusion "
-                   "zone, or every candidate overlapped the query.")
-        hint(
-            "<b>What to try:</b> move the query away from the archive edges so more "
-            "windows survive, raise <b>k matches</b>, or check the <b>Quality</b> tab for "
-            "how many bars were actually loaded."
-        )
-        return
-
-    rows = []
-    for rank, m in enumerate(result.matches, start=1):
-        rows.append({
-            "rank": rank,
-            # Header and value from the same registry: a column headed "(UTC)" above a
-            # bare Eastern date, or headed "start (UTC)" holding "start", is the §BZ
-            # failure at header size.  ``column_config`` is keyed on the same names.
-            stamp_column("start"): stamp_label(pipe.timestamp_at(m.start),
-                                               key=pipe.timeframe),
-            stamp_column("end"): stamp_label(pipe.timestamp_at(m.stop - 1),
-                                             key=pipe.timeframe),
-            "distance": round(float(m.distance), 4),
-            "percentile": pct(m.percentile),
-            "bars": int(m.stop - m.start),
-        })
-    stamp_col_start = stamp_column("start")
-    stamp_col_end = stamp_column("end")
-    st.dataframe(
-        pd.DataFrame(rows), width='stretch', hide_index=True,
-        column_config={
-            "rank": st.column_config.NumberColumn(
-                "rank", help="Position when sorted by distance, best first."),
-            stamp_col_start: st.column_config.TextColumn(
-                stamp_col_start,
-                help="First bar of the matched window, in {}. Compare against the "
-                     "query's own start to see how far back in the archive this "
-                     "analogue sits.".format(stamp_zone_name())),
-            stamp_col_end: st.column_config.TextColumn(
-                stamp_col_end,
-                help="Last bar of the matched window. Forward returns are measured "
-                     "from the bar AFTER this one, never from inside the window "
-                     "(§Z1)."),
-            "distance": st.column_config.NumberColumn(
-                "distance", format="%.4f",
-                help="Geometric gap between the query's feature vector and this "
-                     "window's, on z-scored features. Lower = more similar. Unitless "
-                     "and NOT comparable across different window lengths or different "
-                     "queries — use the percentile instead."),
-            "percentile": st.column_config.TextColumn(
-                "percentile",
-                help="The share of all candidate windows whose distance was at least "
-                     "as small as this one. '0.11%' means only 11 windows in 10,000 "
-                     "resemble your query this closely — that is what makes the match "
-                     "interesting. Lower = rarer. Every match carries one, because the distance "
-                     "metric is fixed — an earlier version also offered a time-warped "
-                     "metric whose percentile had to be reported as unknown (§BD, §E)."),
-            "bars": st.column_config.NumberColumn(
-                "bars",
-                help="Length of the matched window. Always equal to the app's fixed "
-                     "window; if it is not, that is a bug — forward returns "
-                     "would be measured from the wrong bar (§Z1)."),
-        },
-    )
-
-    st.markdown("#### Shape comparison — top 3 matches")
-    hint(
-        "Each tab shows the <b>real tape</b> for that match, drawn exactly like the "
-        "query chart on the <i>Price</i> tab, with a few bars of history on the left "
-        "and a few bars of "
-        "what followed on the right. The orange band is the window that was actually "
-        "scored; the dashed line marks the first bar <i>after</i> it, where forward "
-        "returns are measured from (§Z1)."
-    )
-    hint(
-        "Both charts are rebased to their own first bar, and the lower one autoscales "
-        "to its own bars — so read <i>shape</i>, not absolute size. Look for <b>the "
-        "same sequence of ups and downs inside the band</b> — the wiggle in the same "
-        "order, the same direction, roughly the same size. Then read the grey "
-        "right-hand region: a match whose follow-through looks like your query's "
-        "follow-through is the one worth carrying to the <i>Forecast</i> tab."
-    )
-    hint(
-        "The <b>top chart is brushable</b> — drag a box across it to move the query "
-        "window. The bar count under the chart is what <i>you</i> drew; the query "
-        "itself is always {} bars, centred on your brush. The <b>match chart below is "
-        "read-only</b>: it shows what the matcher found, not something you choose."
-        .format(pipe.length)
-    )
-    hint(
-        "The z-scored feature overlay below is the <i>machine's</i> view of the same "
-        "thing. The two charts above are the <i>human's</i> view, and they are not "
-        "required to agree — the matcher scores `return_z` and `path_z`, not raw "
-        "price level, so a match can trace the feature shape while its close price "
-        "looks completely different (§BC)."
-    )
-    # Three panels on the Matches tab: there the comparison *is* the task -- which of
-    # several analogues is the better precedent is answered by looking at them, so
-    # collapsing to one would hide exactly the evidence the user came for.
-    top = result.matches[:3]
-    if top:
-        # One vertical range for the *query* panel across every tab, so that reference
-        # panel does not rescale as you move between matches.  It is not passed to the
-        # match panels -- those autoscale, so the range covers the query alone and
-        # each match gets framed by its own bars.
-        pad = max(0, int(pad))
-        y_range = shared_rebased_range(pipe, [(query.start, query.stop)], pad)
-        # With a single panel there is nothing to tab between, so a one-item tab strip
-        # would be a click target with no second place to go; three keep the tabs.
-        if len(top) > 1:
-            match_tabs = st.tabs([
-                "#{} · {:.3f} ({})".format(
-                    rank, m.distance, pct(m.percentile)
-                ) for rank, m in enumerate(top, start=1)
-            ])
-        else:
-            match_tabs = [st.container()]
-
-        for tab, rank, m in zip(match_tabs, range(1, len(top) + 1), top):
-            with tab:
-                if len(top) == 1:
-                    st.markdown(
-                        "<b>Best match · #{rank} · distance {d:.3f} · "
-                        "percentile {p}</b>".format(
-                            rank=rank, d=float(m.distance), p=pct(m.percentile)
-                        )
-                    )
-                _render_best_match_pair(
-                    pipe, query, m, rank, pad=pad,
-                    scope=scope, label="match #%d" % rank, show_captions=True,
-                    y_range=y_range,
-                )
-
-                hint(
-                    "Compare the two bands bar-for-bar: does the tall spike fall in the "
-                    "same place, does the drift run the same way, is the dip the same "
-                    "depth? Then compare the grey tails — the left tail is what led "
-                    "into the window, the right tail is what followed it."
-                )
-
-                st.markdown(
-                    "<i>Machine view · z-scored feature overlay used for scoring</i>"
-                )
-                st.plotly_chart(
-                    build_shape_figure(pipe, query.start, m.start, rank, float(m.distance)),
-                    width='stretch', key="shape_%s_%d" % (scope, rank),
-                    config=chart_config(),
-                )
-
-
-# =============================================================================== #
 # Tab: Forecast
 # =============================================================================== #
 FORECAST_COLUMNS = ["horizon_min", "n_valid", "mean_return", "baseline_mean",
@@ -6161,7 +6052,8 @@ def _render_projection_control(horizon: Optional[int]) -> int:
 
     return int(st.slider(
         "Projection bars",
-        min_value=low, max_value=int(high), value=value, step=1,
+        min_value=low, max_value=int(high), value=value,
+        step=50 if _tf().key == "1d" else 1,
         key=forecast_horizon_key(),
         help="How many bars past the window to project. This is the length of the "
              "green band on all three charts on this tab — it changes how far ahead "
@@ -6860,8 +6752,8 @@ def render_archive_sync() -> None:
         # The frontier is the date **most** tickers have reached, and it is the
         # number that answers "can I trust this archive?".
         frontier = status["frontier"]
-        newest = status["newest"].strftime("%d %b %Y") if status["newest"] else "—"
-        frontier_txt = frontier.strftime("%d %b %Y") if frontier else "—"
+        newest = status["newest"].strftime("%B %-d, %Y") if status["newest"] else "—"
+        frontier_txt = frontier.strftime("%B %-d, %Y") if frontier else "—"
 
         # The age is counted in **trading sessions**, because the archive is
         # measured in sessions.  A calendar-day count made a Friday archive look
@@ -7027,10 +6919,19 @@ def render_archive_sync() -> None:
         if st.sidebar.button("Dismiss", key="sync_dismiss", width='stretch'):
             st.session_state.pop(SYNC_RESULT_KEY, None)
 
-    st.sidebar.caption(
-        "Yahoo serves ~30 days of 1-minute history; stored bars are kept "
-        "permanently. Sync once a day so no session expires un-fetched."
-    )
+    tf = _tf()
+    if tf.max_days is None:
+        st.sidebar.caption(
+            "Yahoo serves full daily history with no retention wall; stored bars "
+            "are kept permanently. Sync once a day to catch retroactive revisions."
+        )
+    else:
+        st.sidebar.caption(
+            "Yahoo serves ~{} days of 1-minute history; stored bars are kept "
+            "permanently. Sync once a day so no session expires un-fetched.".format(
+                tf.max_days
+            )
+        )
 
 
 @st.cache_resource(show_spinner=False)
@@ -8095,10 +7996,66 @@ FETCH_SCOPES: Dict[str, Dict[str, str]] = {
             "of intraday tape; Daily gives the whole listing history, a far "
             "larger archive to match over and a very different question. To "
             "change it, reload the page and choose again.\n\n"
-            "**One ticker, one page.** Every tab — Price, Matches, Projection, "
-            "Forecast, Quality and Backtest — is built from the same bars, so a "
-            "forecast is always a forecast of the instrument you are looking at. "
-            "There is no second box to point at another name.\n\n"
+            "**One ticker, one page.** Every tab — Price, Projection, Forecast, "
+            "Quality and Backtest — is built from the same bars, so a forecast is "
+            "always a forecast of the instrument you are looking at. There is no "
+            "second box to point at another name.\n\n"
+            "Class shares are typed with a dash (`BRK-B`); it is converted for you."
+            "\n\nYahoo index symbols take a leading `^` — `^VIX` for the CBOE "
+            "Volatility Index, `^GSPC` for the S&P 500, `^DJI` for the Dow."
+        ),
+        "downloaded": (
+            "Downloading every {2} bar Yahoo has for {1} and redrawing every tab "
+            "on the page. Press it again to pick up bars from the session still "
+            "in progress."
+        ),
+    },
+    "price": {
+        "widget_label": "Ticker symbol",
+        "button_label": "Fetch",
+        "help": (
+            "Any ticker Yahoo Finance accepts. Press **Fetch** to download its bars at "
+            "the chosen resolution and redraw every tab on the page. Nothing is "
+            "written to `data/` — the bars live in memory for this session only.\n\n"
+            "The app opens on **{}**, so there is something on screen before you touch "
+            "anything. Type any other symbol and press **Fetch** to switch.\n\n"
+            "**Resolution is chosen once, when the app opens** — it is shown "
+            "beside this box and is not a control here. 1-minute gives ~29 days "
+            "of intraday tape; Daily gives the whole listing history, a far "
+            "larger archive to match over and a very different question. To "
+            "change it, reload the page and choose again.\n\n"
+            "**One ticker, one page.** Every tab — Price, Projection, Forecast, "
+            "Quality and Backtest — is built from the same bars, so a forecast is "
+            "always a forecast of the instrument you are looking at. There is no "
+            "second box to point at another name.\n\n"
+            "Class shares are typed with a dash (`BRK-B`); it is converted for you."
+            "\n\nYahoo index symbols take a leading `^` — `^VIX` for the CBOE "
+            "Volatility Index, `^GSPC` for the S&P 500, `^DJI` for the Dow."
+        ),
+        "downloaded": (
+            "Downloading every {2} bar Yahoo has for {1} and redrawing every tab "
+            "on the page. Press it again to pick up bars from the session still "
+            "in progress."
+        ),
+    },
+    "forecast": {
+        "widget_label": "Ticker symbol",
+        "button_label": "Fetch",
+        "help": (
+            "Any ticker Yahoo Finance accepts. Press **Fetch** to download its bars at "
+            "the chosen resolution and redraw every tab on the page. Nothing is "
+            "written to `data/` — the bars live in memory for this session only.\n\n"
+            "The app opens on **{}**, so there is something on screen before you touch "
+            "anything. Type any other symbol and press **Fetch** to switch.\n\n"
+            "**Resolution is chosen once, when the app opens** — it is shown "
+            "beside this box and is not a control here. 1-minute gives ~29 days "
+            "of intraday tape; Daily gives the whole listing history, a far "
+            "larger archive to match over and a very different question. To "
+            "change it, reload the page and choose again.\n\n"
+            "**One ticker, one page.** Every tab — Price, Projection, Forecast, "
+            "Quality and Backtest — is built from the same bars, so a forecast is "
+            "always a forecast of the instrument you are looking at. There is no "
+            "second box to point at another name.\n\n"
             "Class shares are typed with a dash (`BRK-B`); it is converted for you."
             "\n\nYahoo index symbols take a leading `^` — `^VIX` for the CBOE "
             "Volatility Index, `^GSPC` for the S&P 500, `^DJI` for the Dow."
@@ -8246,7 +8203,10 @@ def resolve_ticker(scope: str = "price") -> Optional[ResolvedScope]:
     if st.session_state.pop(pending_key, None):
         # Disable the fetch button while downloading
         st.session_state["fetch_disabled"] = True
-        raw = st.session_state.get(input_key)
+        # Read from the non-widget ticker key, which holds the symbol in force.
+        # The widget input key is never written to session state directly -- that
+        # would raise StreamlitValueAssignmentNotAllowedError on the next render.
+        raw = st.session_state.get(ticker_key)
         # **The symbol that was *asked for*, recorded before the attempt.**  The
         # failure has to name the thing the reader typed: reporting the error against
         # the symbol still in force reads as "AAPL has no bars" when what happened is
@@ -8282,6 +8242,9 @@ def resolve_ticker(scope: str = "price") -> Optional[ResolvedScope]:
             # different bars.  Clearing it is what stops the page reporting yesterday's
             # match count over today's price chart.
             st.session_state[ticker_key] = sym
+            # Reset the widget input key so the text box re-seeds from value= on the
+            # next render instead of holding the old typed text.
+            st.session_state.pop(input_key, None)
             _add_recent_ticker(sym)
             reset_query_state("app", sym)
         else:
@@ -8441,9 +8404,12 @@ def render_ticker_input(scope: str) -> Optional[str]:
                              st.session_state[ticker_key].lower(),
                              resolve_timeframe(ACTIVE_TIMEFRAME[0]).label.lower()),
                          disabled=st.session_state.get("fetch_disabled", False)):
-            # A *non-widget* key, because the button's own key is read-only: writing
-            # to it raises.  ``resolve_ticker`` pops this on the next pass, which is
-            # where the download and the state reset happen.
+            # Capture the typed value into the durable ticker key before the fetch.
+            # Writing to the widget input key directly would raise
+            # StreamlitValueAssignmentNotAllowedError on the next render.
+            typed = st.session_state.get(input_key)
+            if typed:
+                st.session_state[ticker_key] = typed
             st.session_state[pending_key] = True
             st.rerun()
 
@@ -8567,8 +8533,7 @@ def render_sidebar() -> Dict[str, Any]:
 
     The help here is deliberately *attached to the control it describes* rather than
     collected in one page: the question "what does this slider do?" is only ever asked
-    while the slider is on screen.  The long-form manual is one click away via the
-    :func:`help_dialog` button at the top of this sidebar.
+    while the slider is on screen.
     """
     with st.sidebar:
 
@@ -8584,7 +8549,10 @@ def render_sidebar() -> Dict[str, Any]:
             with cols[i % 4]:
                 if st.button(sym, key="recent_{}".format(sym), width='stretch',
                              help="Load {} bars".format(sym)):
-                    st.session_state[input_key] = sym
+                    # Write to the non-widget ticker key, not the widget input key.
+                    # Writing to a widget key via session state raises
+                    # StreamlitValueAssignmentNotAllowedError on the next render.
+                    st.session_state[ticker_key] = sym
                     st.session_state[pending_key] = True
                     st.rerun()
 
@@ -8603,15 +8571,10 @@ def render_sidebar() -> Dict[str, Any]:
         # Ticker input for the whole session.
         render_ticker_input("app")
 
-        if st.button(HELP_ICON + "  How to use this app", width='stretch',
-                     help="Full manual: the workflow, every control, and a "
-                          "glossary of every term and metric."):
-            help_dialog()
-
         st.divider()
 
         # **The ticker input is now here in the sidebar, and there is exactly one.**
-        # Every tab — Price, Matches, Projection, Forecast, Quality and Backtest —
+        # Every tab — Price, Projection, Forecast, Quality and Backtest —
         # is built from the same archive.
         #
         # Nothing is fetched here any more, so nothing gates the sidebar either.
@@ -8993,12 +8956,6 @@ def main() -> None:
         )
     with button_col:
         st.markdown('<div style="height:1.5rem"></div>', unsafe_allow_html=True)
-        if st.button(HELP_ICON + "  How to use this app", width='stretch',
-                     type="primary",
-                     help="Full manual: the workflow, every control, and a "
-                          "glossary of every metric shown on any tab."):
-            help_dialog()
-
     st.caption(
         "Source: **{}** fetched live from Yahoo Finance — not written to "
         "`data/`, so it lives only for this session.  ·  Every tab — Price, "
@@ -9013,7 +8970,25 @@ def main() -> None:
             # ``symbol`` alone would let a daily pipeline be served under the entry
             # built from 1-minute bars, which is the same silent collision the fetch
             # cache is keyed to avoid.
-            bars = fetch_ticker_cached(symbol, timeframe=tf.key).frame
+            #
+            # On a fresh Streamlit start the in-memory fetch store is empty, so
+            # ``fetch_ticker_cached`` always re-downloads from yfinance even when the
+            # partitioned Parquet archive on disk already holds bars from earlier
+            # loads.  Read the archive first so "bars loaded" reflects everything we
+            # have, not just what yfinance returned this session.
+            archive_root = panel_root_for(tf.key)
+            bars = None
+            if os.path.isdir(archive_root):
+                try:
+                    archived = PanelStore(archive_root).load(
+                        tickers=[symbol],
+                    )
+                    if not archived.empty:
+                        bars = archived[archived["ticker"] == symbol].copy()
+                except Exception:  # noqa: BLE001 - fall through to a fresh fetch
+                    bars = None
+            if bars is None or bars.empty:
+                bars = fetch_ticker_cached(symbol, timeframe=tf.key).frame
             pipe = pipeline_from_frame(
                 "{}@{}".format(symbol, tf.key), bars, active_length(), timeframe=tf
             )
@@ -9148,7 +9123,7 @@ def main() -> None:
             "candidates behind it yields a meaningless percentile either way.".format(
                 pipe.n_bars)
         )
-        tabs = st.tabs(list(TAB_ORDER), default=DEFAULT_TAB, key=tabs_key())
+        tabs = st.tabs(list(TAB_ORDER), default=get_default_tab(), key=tabs_key())
         with tabs[TAB_ORDER.index("Quality")]:
             render_quality_tab(pipe)
         with tabs[TAB_ORDER.index("Price")]:
@@ -9160,11 +9135,9 @@ def main() -> None:
             # ticker is exactly the remedy the message should be pointing at.
             render_scope_ticker(
                 "price",
-                note="This instrument also drives <b>Matches</b>, <b>Quality</b> and "
+                note="This instrument also drives <b>Quality</b> and "
                      "<b>Backtest</b>. A more liquid symbol usually has more history.",
             )
-        with tabs[TAB_ORDER.index("Matches")]:
-            st.info("Matching is disabled until the pipeline is ready.")
         with tabs[TAB_ORDER.index("Projection")]:
             # **Gated on the Forecast pipeline, not the Price one.**  This branch is
             # entered because the *Price* archive is too thin, which says nothing
@@ -9246,6 +9219,8 @@ def main() -> None:
                     )
         with tabs[TAB_ORDER.index("Live")]:
             render_live_tab(pipe, symbol)
+        with tabs[TAB_ORDER.index("Scan")]:
+            render_scan_tab(pipe, symbol)
         with tabs[TAB_ORDER.index("Backtest")]:
             st.info("Backtesting is disabled until the pipeline is ready.")
         with tabs[TAB_ORDER.index("Panel")]:
@@ -9355,7 +9330,6 @@ def main() -> None:
     # exists to prevent.
     #
     # ``main`` no longer runs the search, and no longer tracks whether one is due.
-    # Both moved into the Matches tab below, which is the only tab that needs them:
     # ``main`` resolved the *window*, and one run cannot serve two windows any more.
     # The trigger logic is unchanged in shape when it lands there -- the run is still
     # button-gated, still fires once per *new* brush rather than once per rerun, and
@@ -9369,9 +9343,7 @@ def main() -> None:
     # The onboarding tour used to render here, above the tab bar, so it appeared on
     # every tab.  It was then moved into the *Chart* tab body -- and went with that tab.
     # ``render_onboarding`` and the "New here? Start with the 60-second tour" expander
-    # that hosted it are gone; the full manual is still one click away from any tab via
-    # the **How to use this app** button in the page header, which is where a
-    # first-time reader is pointed now.
+    # that hosted it are gone.
 
     # ---------------- Tabs --------------------------------------------------- #
     # ``default=DEFAULT_TAB`` opens the page on Projection -- the fixed reference.
@@ -9381,7 +9353,7 @@ def main() -> None:
     # *Projection*: ``reset_query_state`` bumps the generation, a new key is a new block
     # id, and a new block id is the one situation in which ``default`` is honoured.
     # See ``TABS_KEY``.
-    tabs = st.tabs(list(TAB_ORDER), default=DEFAULT_TAB, key=tabs_key())
+    tabs = st.tabs(list(TAB_ORDER), default=get_default_tab(), key=tabs_key())
 
     # Unpacked by *name* rather than positionally.  ``TAB_ORDER`` had gained "Panel"
     # without the positional six-way unpack below being updated, which raised
@@ -9391,13 +9363,13 @@ def main() -> None:
     # here, and a missing key is still a loud failure rather than a silent one.
     tab_by_name = dict(zip(TAB_ORDER, tabs))
     tab_price = tab_by_name["Price"]
-    tab_matches = tab_by_name["Matches"]
     tab_projection = tab_by_name["Projection"]
     tab_forecast = tab_by_name["Forecast"]
     tab_live = tab_by_name["Live"]
     tab_panel = tab_by_name["Panel"]
     tab_quality = tab_by_name["Quality"]
     tab_backtest = tab_by_name["Backtest"]
+    tab_scan = tab_by_name["Scan"]
 
     with tab_price:
         # The guide, rendered here rather than left in ``TAB_GUIDE`` unread.  This tab
@@ -9406,7 +9378,7 @@ def main() -> None:
         # it without putting text between the reader and the tape, which is the one
         # thing this tab is for.  Collapsed by default, so it costs nothing visually.
         #
-        # Every other tab does the same (``guide("Matches")`` and friends), so this is
+        # Every other tab does the same (``guide("Price")`` and friends), so this is
         # not a new convention: it is the one tab that was missing one.
         guide("Price")
 
@@ -9450,10 +9422,8 @@ def main() -> None:
         # question.  Now the candidate pool is every window of every archived
         # constituent, so a match can come from NVDA when the query is QQQ.
         #
-        # ``k`` is the *default*, not the Matches tab's ``k matches`` slider: this
-        # panel shows only the single closest match, so there is nothing for a larger
-        # ``k`` to select, and binding it to that slider would make a control labelled
-        # "how many matches" silently resize a chart that never shows more than one.
+        # ``k`` is the *default*: this panel shows only the single closest match, so
+        # there is nothing for a larger ``k`` to select.
         #
         # ``max_per_ticker`` is the cap ``find_panel_matches`` applies *within* one
         # ticker, not a cap on the number of tickers consulted.  It stays at the
@@ -9609,73 +9579,12 @@ def main() -> None:
                     int(panel_result.n_tickers),
                 )
             )
-            render_matches_tab(match_pipe, panel_result_as_match_result(panel_result),
-                               compact=True,
-                               chart_width=price_width,
-                               # No ``anchor``.  The compact path is ``pannable``, and
-                               # the pannable branch replaces its view with
-                               # ``centred_view`` unconditionally -- so an anchor here
-                               # was already dead before this change, and it was only
-                               # still wired up because the top chart used the same
-                               # value.  Equal bar width (``price_width``) is the
-                               # property that still matters, and it is unaffected.
-                               pannable=True,
-                               height=pair_height)
-
-    with tab_matches:
-        guide("Matches")
-
-        # This tab's own search, over the window the *Price* brush defined.  The
-        # controls live here rather than in the sidebar so this analysis and the
-        # Projection tab's are configured independently -- and the result is computed
-        # here rather than in ``main`` so it cannot be the Projection tab's.
-        cfg_m = _render_search_controls("matches")
-
-        # ``length`` rather than ``pipe.length``: a brush defines its own window, so
-        # the key has to name the length actually searched.  The settings are in it
-        # for a stronger reason -- they change what a distance *means*, so a result
-        # carried over from different dials would be reporting a percentile computed
-        # against a distribution the reader is no longer looking at.
-        signature = (symbol, length, cfg_m["k"], start_idx, stop_idx,
-                     cfg_m["n_baseline"], cfg_m["min_matches"], cfg_m["seed"],
-                     cfg["amplitude_weight"])
-        # A brush is consumed once.  Streamlit keeps a selection for the page's
-        # lifetime, so ``price_brush`` is non-``None`` on every later rerun too;
-        # auto-running whenever one is merely *present* would recompute the forecast
-        # every time an unrelated slider moved.  The recorded span is the post-clamp
-        # one, so a clamped brush cannot disagree with it and re-fire forever.
-        brush_moved = (st.session_state.get(price_applied_key()) != (start_idx, stop_idx)
-                       and price_brush is not None)
-        if cfg_m["run_clicked"] or brush_moved:
-            st.session_state[price_applied_key()] = (start_idx, stop_idx)
-            st.session_state[price_run_key()] = signature
-
-        out = None
-        if st.session_state.get(price_run_key()) == signature:
-            # The trigger differs -- button or brush -- and the wording says which, so
-            # an auto-run is never mistaken for a search the user asked for by hand.
-            reason = "window changed" if brush_moved else "searching"
-            with st.spinner("{} {} windows and building the baseline for {}…".format(
-                    reason.capitalize(), length,
-                    stamp_span(stamps.iloc[start_idx], stamps.iloc[stop_idx - 1]))):
-                out = pipe.run(
-                    query, k=cfg_m["k"], horizons=active_horizons(),
-                    seed=cfg_m["seed"], n_baseline=cfg_m["n_baseline"],
-                    min_matches=cfg_m["min_matches"],
-                    amplitude_weight=cfg["amplitude_weight"],
-                )
-
-        if out is None:
-            st.info("**No search has been run yet.** Press **Run match** above, in "
-                    "*Search settings*. Brushing a window on the *Price* tab also "
-                    "runs it.")
-            hint(
-                "Results are never cached, so a stale answer can never be mistaken "
-                "for a fresh one. Change the window, the brush, or any control and "
-                "this tab empties again until you search."
+            _render_best_match_pair(
+                match_pipe, panel_result_as_match_result(panel_result).query,
+                panel_result.matches[0], 1, pad=CONTEXT_BARS,
+                scope="price", show_query=False, chart_width=price_width,
+                pannable=True, height=pair_height,
             )
-        else:
-            render_matches_tab(pipe, out["result"])
 
     with tab_projection:
         # **No ticker input on this tab.**  It moved to *Forecast*, below, which is
@@ -9742,6 +9651,9 @@ def main() -> None:
 
     with tab_live:
         render_live_tab(pipe, symbol, amplitude_weight=cfg["amplitude_weight"])
+
+    with tab_scan:
+        render_scan_tab(pipe, symbol, amplitude_weight=cfg["amplitude_weight"])
 
     with tab_panel:
         # The panel reads its own archive rather than `pipe`, so it is rendered even

@@ -1015,8 +1015,7 @@ class TestResolutionGateBehaviour:
         # ``tf_key`` also end in ``_key`` and take arguments, so a suffix scan would
         # call them with none.
         names = ["price_brush_key", "forecast_brush_key", "forecast_selection_key",
-                 "price_run_key", "price_applied_key", "forecast_run_key",
-                 "forecast_applied_key"]
+                 "forecast_run_key", "forecast_applied_key"]
         ns = load_app_functions(set(names))
 
         ns["ACTIVE_TIMEFRAME"][0] = "1m"

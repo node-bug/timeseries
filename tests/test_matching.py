@@ -756,7 +756,7 @@ class TestFindMatchesRespectsValidMask:
 
 class TestSessionMaskEndToEnd:
     def test_pipeline_run_reports_no_contaminated_forward_return(self):
-        """The guarantee that matters to a reader of the Matches tab."""
+        """The guarantee that matters to a reader of the match panel."""
         bars = session_bars(FIXTURE_BARS)
         pipe = Pipeline.from_frame(bars, length=60)
         from timeseries.pipeline import session_boundary_mask

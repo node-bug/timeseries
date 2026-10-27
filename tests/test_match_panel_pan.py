@@ -343,14 +343,13 @@ class TestPriceTabWiring:
         calls = [n for n in ast.walk(ast.parse(fragment))
                  if isinstance(n, ast.Call)
                  and isinstance(n.func, ast.Name)
-                 and n.func.id == "render_matches_tab"]
+                 and n.func.id == "_render_best_match_pair"]
         assert len(calls) == 1, "expected the Price tab to render exactly one match panel"
         kwargs = {kw.arg: ast.unparse(kw.value) for kw in calls[0].keywords}
         assert kwargs.get("pannable") == "True", (
             "the Price tab's match panel is not pannable, so the lower graph still "
             f"draws a zoom box when dragged; got {kwargs.get('pannable')!r}"
         )
-        assert kwargs.get("compact") == "True", "the Price tab draws the compact panel"
 
     def test_price_tab_still_passes_the_shared_width(self):
         """Consistent bar count depends on the width surviving the change."""
@@ -398,7 +397,7 @@ class TestPriceTabWiring:
 
     def test_match_panel_passes_the_pan_arguments_through(self):
         """``pannable`` must reach the figure, not just the signature."""
-        body = app_block(r"def _render_best_match_pair\(.*?\n(?=def render_matches_tab)",
+        body = app_block(r"def _render_best_match_pair\(.*?\n(?=def _render_search_controls)",
                          "_render_best_match_pair body")
         for needed in ("pan_data=m_pan_data", "pan_bounds=m_pan_bounds",
                        "pannable=pannable"):
@@ -418,7 +417,7 @@ class TestPriceTabWiring:
         drag walks the match straight off the screen.  This is the mutation that left
         the whole suite green.
         """
-        body = app_block(r"def _render_best_match_pair\(.*?\n(?=def render_matches_tab)",
+        body = app_block(r"def _render_best_match_pair\(.*?\n(?=def _render_search_controls)",
                          "_render_best_match_pair body")
         assert "pan_axis_bounds_for(pipe.n_bars, m.start, m.stop, chart_width)" in body, (
             "the match panel must derive its bounds from the match's own span -- "
@@ -435,7 +434,7 @@ class TestPriceTabWiring:
         Widening both would show more bars than the chart above and break the
         equal-scale comparison the Price tab exists for.
         """
-        body = app_block(r"def _render_best_match_pair\(.*?\n(?=def render_matches_tab)",
+        body = app_block(r"def _render_best_match_pair\(.*?\n(?=def _render_search_controls)",
                          "_render_best_match_pair body")
         assert "m_view = centred_view(pipe.n_bars, m.start, m.stop, chart_width)" in body, (
             "the pannable view must stay at chart_width bars wide so both Price-tab "
@@ -454,7 +453,7 @@ class TestPriceTabWiring:
         change the visible bar count.  Clipping the data to the bounds confines it to
         the span the reader can already pan across.
         """
-        body = app_block(r"def _render_best_match_pair\(.*?\n(?=def render_matches_tab)",
+        body = app_block(r"def _render_best_match_pair\(.*?\n(?=def _render_search_controls)",
                          "_render_best_match_pair body")
         assert "(m_pan_bounds[0], m_pan_bounds[1])" in body, (
             "pan_data must be the bounds themselves -- drawing the whole archive "

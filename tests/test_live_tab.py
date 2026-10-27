@@ -669,7 +669,7 @@ class TestTheAxisHasNoDuplicateTimestamp:
         )
         # And the label is the anchor's own time of day.
         anchor_ts_local = pd.Timestamp(pipe.bars["timestamp"].iloc[anchor])
-        assert at_anchor[0] == anchor_ts_local.strftime("%Y-%m-%d %H:%M")
+        assert at_anchor[0] == anchor_ts_local.strftime("%B %-d, %Y %H:%M")
 
     def test_the_projection_starts_on_the_anchor_bar(self):
         """Offset 0 is the anchor, so the projection and the history share it.
@@ -745,8 +745,8 @@ class TestTheSeparatorIsPinned:
     """The dotted line stays on the same bar as the tape rolls.
 
     The line down the Live chart is the boundary between the tape and the
-    projection.  It stands on the **first bar that belongs to the projection
-    alone** -- the bar just after the one the frozen projection grows out of
+    projection.  It stands on **where the projection bars start** -- offset 0
+    of the forecast path, which is the bar the frozen projection grows out of
     -- and it has to **hold still** while the tape rolls past it, otherwise
     the reader is watching a forecast that is already behind the tape, with no
     marker saying where the prediction was actually made.
@@ -759,8 +759,8 @@ class TestTheSeparatorIsPinned:
     It also pointed at the wrong bar.  Drawn on the *anchor* it stood on the
     last real bar, which reads as "the tape ends here" -- and on the Live tab
     the tape does not end there at all, it rolls on past the line to the
-    right.  The first bar that exists only in the projection is the one after
-    the anchor, because offset 0 of a forecast path *is* the anchor.
+    right.  Offset 0 of a forecast path *is* the anchor, so the line belongs
+    on the anchor itself.
     """
 
     def _figure(self, pipe, anchor, start):
@@ -797,13 +797,13 @@ class TestTheSeparatorIsPinned:
         assert anchor is not None and start is not None
 
         fig = self._figure(later, anchor, start)
-        assert self._separator_x(fig) == float(anchor) + 1, (
-            "the separator must stay on the first projected bar, the one after "
-            "the pinned anchor"
+        assert self._separator_x(fig) == float(anchor), (
+            "the separator must stay where the projection bars start, on the "
+            "pinned anchor"
         )
         # And the bar it names is the same bar, not merely the same index.
         assert later.bars["timestamp"].iloc[int(self._separator_x(fig))] == (
-            later.bars["timestamp"].iloc[anchor + 1]
+            later.bars["timestamp"].iloc[anchor]
         )
 
     def test_the_separator_is_not_the_archive_tail(self):
@@ -855,9 +855,9 @@ class TestTheSeparatorIsPinned:
             "the shaded region is drawn backwards: it starts at %r and ends at %r"
             % (x0, x1)
         )
-        assert x0 == float(anchor) + 1, (
-            "the shaded region must begin at the separator -- the first "
-            "projected bar"
+        assert x0 == float(anchor), (
+            "the shaded region must begin at the separator -- where the "
+            "projection bars start"
         )
 
         proj_x = [int(v) for v in fig.data[-1].x]
@@ -868,12 +868,11 @@ class TestTheSeparatorIsPinned:
     def test_the_projection_still_starts_on_the_pinned_bar(self):
         """The line and the projection must agree on where the boundary is.
 
-        The line stands on the first bar that belongs to the projection
-        *alone*, but the projection's **trace** still starts on the anchor:
-        offset 0 of a forecast path *is* the anchor bar, so the two halves
-        meet at one point rather than at two points a bar apart.  A pinned
-        line with a projection anchored somewhere else would be a line
-        pointing at nothing.
+        The line stands where the projection bars start -- offset 0 of a
+        forecast path, which *is* the anchor bar -- and the projection's
+        **trace** also starts on the anchor.  The two halves meet at one
+        point rather than at two points a bar apart.  A pinned line with a
+        projection anchored somewhere else would be a line pointing at nothing.
         """
         first = _window(0, 1170)
         later = _window(0, 1560)
@@ -891,18 +890,18 @@ class TestTheSeparatorIsPinned:
             "the projection's offset 0 is the anchor bar -- the one the "
             "projection grows out of"
         )
-        assert min(proj_x) == int(self._separator_x(fig)) - 1, (
-            "the separator stands one bar past the anchor, on the first bar "
-            "that belongs to the projection alone"
+        assert min(proj_x) == int(self._separator_x(fig)), (
+            "the separator stands where the projection bars start, on the "
+            "anchor itself"
         )
 
-    def test_the_separator_stands_on_the_first_projected_bar(self):
-        """The line is on the first bar that exists *only* in the projection.
+    def test_the_separator_stands_where_the_projection_begins(self):
+        """The line is on the bar where the projection bars start.
 
-        The anchor is a real bar -- the last one at the moment the forecast
-        was made -- so a line drawn on it points at the tape rather than at
-        the projection.  The first projected-only bar is the one after it,
-        and that is where the line belongs.
+        Offset 0 of a forecast path *is* the anchor bar -- the bar history
+        and forecast share -- so that is where the line belongs.  It marks
+        where the projected bars begin rather than pointing at the real bar
+        they grow out of.
         """
         first = _window(0, 1170)
         later = _window(0, 1560)
@@ -917,12 +916,11 @@ class TestTheSeparatorIsPinned:
         fig = self._figure(later, anchor, start)
         sep = int(self._separator_x(fig))
 
-        # The bar the line stands on is *not* a bar of the real tape's
-        # projected history -- it is one bar past the anchor.
-        assert sep == anchor + 1
-        assert sep > anchor, (
-            "the separator must not sit on the anchor: the anchor is a real "
-            "bar, and the line is meant to mark where the projection begins"
+        # The bar the line stands on is where the projection bars start --
+        # the anchor itself.
+        assert sep == anchor
+        assert sep == min(int(v) for v in fig.data[-1].x), (
+            "the separator must sit where the projection's trace starts"
         )
 
     def test_the_separator_names_the_same_moment_in_every_frame(self):
@@ -958,8 +956,8 @@ class TestTheSeparatorIsPinned:
         sep_later = int(self._separator_x(fig_later))
 
         # The same position relative to the pinned anchor, in both frames.
-        assert sep_first == anchor_first + 1
-        assert sep_later == anchor_later + 1
+        assert sep_first == anchor_first
+        assert sep_later == anchor_later
 
         # And the anchor the line grows from is the same moment in both --
         # that is the pin holding.
@@ -967,13 +965,11 @@ class TestTheSeparatorIsPinned:
             later.bars["timestamp"].iloc[anchor_later]
         )
 
-        # In the grown archive the separator's position is the real bar that
-        # came straight after the anchor -- the next bar of the tape, whatever
-        # its clock time (the anchor sits at a session's close, so that is the
-        # next session's open).
+        # In the grown archive the separator's position is the anchor itself --
+        # the same moment the pin was taken on, whatever its clock time.
         after = later.bars["timestamp"].iloc[sep_later]
-        assert after == later.bars["timestamp"].iloc[anchor_later + 1]
-        assert after > later.bars["timestamp"].iloc[anchor_later]
+        assert after == later.bars["timestamp"].iloc[anchor_later]
+        assert after > later.bars["timestamp"].iloc[anchor_later - 1]
 
     def test_the_projection_meets_the_tape_at_the_anchor(self):
         """The two halves join at the anchor bar, at the same price.
@@ -1028,10 +1024,10 @@ class TestTheSeparatorIsPinned:
         anchor twice -- once as a full timestamp and once as a bare clock
         time.
 
-        The **separator itself** is one bar further on, and it is labelled by
-        the projection's offset-1 tick: the clock time that bar *would*
-        occur at.  An unlabelled separator is a boundary the reader cannot
-        place, so it must be named exactly once too.
+        The **separator itself** stands where the projection bars start -- on
+        the anchor -- and it is labelled by the anchor's own timestamp.  An
+        unlabelled separator is a boundary the reader cannot place, so it
+        must be named exactly once too.
         """
         first = _window(0, 1170)
         later = _window(0, 1560)
@@ -1059,7 +1055,7 @@ class TestTheSeparatorIsPinned:
         )
         assert at_anchor[0] == pd.Timestamp(
             later.bars["timestamp"].iloc[anchor]
-        ).strftime("%Y-%m-%d %H:%M")
+        ).strftime("%B %-d, %Y %H:%M")
 
         # The separator is labelled exactly once as well.
         sep = int(self._separator_x(fig))
@@ -1067,8 +1063,8 @@ class TestTheSeparatorIsPinned:
         assert len(at_sep) == 1, (
             "the separator must be labelled exactly once, got %r" % (at_sep,)
         )
-        # Its label is the projected clock time of the bar it stands on.
-        assert at_sep[0] == (
-            pd.Timestamp(later.bars["timestamp"].iloc[anchor])
-            + pd.Timedelta(minutes=1)
-        ).strftime("%H:%M")
+        # Its label is the anchor's own timestamp, since the separator stands
+        # where the projection bars start -- on the anchor itself.
+        assert at_sep[0] == pd.Timestamp(
+            later.bars["timestamp"].iloc[anchor]
+        ).strftime("%B %-d, %Y %H:%M")

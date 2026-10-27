@@ -91,7 +91,7 @@ class TestTheComponentExists:
 
 class TestPythonSideWiring:
     def test_pannable_panel_uses_the_component(self):
-        body = app_block(r"def _render_best_match_pair\(.*?\n(?=def render_matches_tab)",
+        body = app_block(r"def _render_best_match_pair\(.*?\n(?=def _render_search_controls)",
                          "_render_best_match_pair body")
         assert "render_clamped_pan_chart(" in body, (
             "the pannable panel is not routed to the clamped component, so a drag past "
@@ -99,7 +99,7 @@ class TestPythonSideWiring:
         )
 
     def test_other_panels_still_use_plotly_chart(self):
-        body = app_block(r"def _render_best_match_pair\(.*?\n(?=def render_matches_tab)",
+        body = app_block(r"def _render_best_match_pair\(.*?\n(?=def _render_search_controls)",
                          "_render_best_match_pair body")
         assert "st.plotly_chart(" in body, (
             "the non-pannable panels must keep using st.plotly_chart"

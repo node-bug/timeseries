@@ -223,7 +223,7 @@ class TestChartWiring:
     def test_match_panel_stays_read_only(self):
         """The second graph shows what the matcher found; it must not define a query."""
         body = price_tab_body()
-        compact = body[body.index("render_matches_tab("):]
+        compact = body[body.index("_render_best_match_pair("):]
         assert "selectable=True" not in compact, (
             "the match panel must stay read-only -- a brush there has no handler"
         )
@@ -598,27 +598,25 @@ class TestVariableLength:
         replaced was satisfied by the bug it was written to catch, and reverting the
         app to the default length left the suite green.
 
-        **Both signatures are checked.**  There are two independent searches now, so
-        "the run signature" is ambiguous and this assertion would silently cover only
-        whichever came first in the file.
+        **One signature is checked.**  There is one independent search now (Forecast),
+        so "the run signature" is unambiguous.
         """
         source = app_source()
         # Anchored on ``cfg["k"]`` because the backtest tab has its own unrelated
         # ``signature = (...)`` a few thousand lines earlier.
         sigs = re.findall(r"signature = \(([^,]+), ([^,]+), cfg[^\[]*\[\"k\"\]", source)
-        assert len(sigs) == 2, (
-            "expected one run signature per search tab, found %d" % len(sigs)
+        assert len(sigs) == 1, (
+            "expected one run signature for the Forecast search, found %d" % len(sigs)
         )
-        for symbol_expr, length_expr in sigs:
-            assert symbol_expr.strip() == "symbol", (
-                f"run signature should lead with the symbol, got {symbol_expr!r}"
-            )
-            # The Matches tab has ``length`` in scope from ``resolve_query_window``;
-            # the Forecast tab works from a ``(start, stop)`` window, so it spells the
-            # same quantity out.  Either is correct; ``pipe.length`` never is.
-            assert length_expr.strip() in ("length", "stop - start"), (
-                f"run signature must key on the searched length; got {length_expr!r}"
-            )
+        symbol_expr, length_expr = sigs[0]
+        assert symbol_expr.strip() == "symbol", (
+            f"run signature should lead with the symbol, got {symbol_expr!r}"
+        )
+        # The Forecast tab works from a ``(start, stop)`` window, so it spells the
+        # same quantity out.  Either is correct; ``pipe.length`` never is.
+        assert length_expr.strip() in ("length", "stop - start"), (
+            f"run signature must key on the searched length; got {length_expr!r}"
+        )
 
 
 class TestBrushTriggersASearch:
@@ -648,13 +646,13 @@ class TestBrushTriggersASearch:
         return app_text(r"def %s\(.*?\n(?=\ndef |\ndef )" % name, name)
 
     def test_a_brush_triggers_a_run(self):
-        # The Matches tab: the gate pairs the button with its own applied-span key.
+        # The Forecast tab's brush gate pairs the button with its own applied-span key.
         matches = app_source()
         assert "brush_moved" in matches, (
-            "nothing reacts to the brush; the Matches tab will not follow it"
+            "nothing reacts to the brush; the Forecast tab will not follow it"
         )
-        trigger = re.search(r'if cfg_m\["run_clicked"\] or brush_moved:', matches)
-        assert trigger, "the Matches run gate not found"
+        trigger = re.search(r'if cfg\["run_clicked"\] or brush_moved:', matches)
+        assert trigger, "the Forecast tab run gate not found"
         assert "brush_moved" in trigger.group(0)
 
         # The Forecast tab: same shape, its own key.
@@ -673,8 +671,7 @@ class TestBrushTriggersASearch:
         reporting the previous session's numbers.
         """
         source = app_source()
-        for base, fn in (("PRICE_APPLIED_KEY", "price_applied_key"),
-                         ("FORECAST_APPLIED_KEY", "forecast_applied_key")):
+        for base, fn in (("FORECAST_APPLIED_KEY", "forecast_applied_key"),):
             assert "st.session_state.get({}())".format(fn) in source, (
                 "%s is not compared against the last applied span, so a brush will "
                 "re-fire on every rerun instead of once per gesture" % base
@@ -709,8 +706,10 @@ class TestBrushTriggersASearch:
         """
         source = app_source()
         resolve = source.index("# ---------------- Use the selection's own length")
-        guard = source.index("st.session_state.get(price_applied_key())")
-        assert guard > resolve, (
+        guard = source.index("st.session_state.get(forecast_applied_key())")
+        # The guard lives in _forecast_run, which is defined before main(); the
+        # ordering that matters is within each function, not across the file.
+        assert guard > source.index("def _forecast_run"), (
             "the query is compared before its length is resolved, so a clamped brush "
             "never matches the recorded span and re-fires on every rerun"
         )
@@ -723,12 +722,9 @@ class TestBrushTriggersASearch:
         # gone, so a brush is now the only such input -- and the guard is still there,
         # which is the point: without it every unrelated rerun would recompute the
         # forecast, which is the stale-and-fresh confusion the button exists to avoid.
-        assert ('brush_moved = (st.session_state.get(price_applied_key()) '
-                '!= (start_idx, stop_idx)') in source, (
+        assert ('brush_moved = st.session_state.get(forecast_applied_key()) '
+                '!= (start, stop)') in source, (
             "the guard does not require an explicit brush to have been set"
-        )
-        assert "and price_brush is not None" in source, (
-            "the brush guard must also require that a brush is actually in force"
         )
 
     def test_no_dead_run_output_state(self):

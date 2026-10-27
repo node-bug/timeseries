@@ -673,8 +673,9 @@ class TestAppWiring:
             "silently breaks whenever TAB_ORDER grows"
         )
         # The old shape must not come back.
-        assert not re.search(r"^\s*tab_price, tab_chart, tab_matches.*= tabs\s*$",
+        assert not re.search(r"^\s*tab_price, tab_matches.*= tabs\s*$",
                              src, re.M), "positional tab unpack reintroduced"
+        assert "tab_matches" not in src, "tab_matches variable reintroduced"
 
     def test_every_tab_in_tab_order_is_rendered(self):
         """A tab in ``TAB_ORDER`` with no ``with`` block renders as an empty panel
@@ -906,7 +907,7 @@ class TestAppWiring:
         # an ordering assertion on commented source has to be positional.
         #
         # Scoped to *each tab's own body*, not to the file.  ``guide`` is also called
-        # from ``render_matches_tab``, which runs long before the tab bar, so a
+        # from ``_render_search_controls``, which runs long before the tab bar, so a
         # whole-file "first call" comparison measures a helper against the tabs and
         # fails on correct code.
         def calls_in(body_text):
