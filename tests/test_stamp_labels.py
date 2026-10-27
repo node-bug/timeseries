@@ -43,7 +43,7 @@ from session_bars import session_bars
 #: stamp is a 09:30 *Eastern* open, which is 13:30 UTC under EDT -- so a helper that
 #: printed the UTC calendar date would look right for the wrong reason in summer and
 #: be off by an hour, never a day, which is the easy mistake to make here.
-DAY = "2026-09-03"
+DAY = "September 3, 2026"
 OPEN_ET = pd.Timestamp("2026-09-03 13:30:00", tz="UTC")   # 09:30 EDT
 OPEN_EST = pd.Timestamp("2026-01-05 14:30:00", tz="UTC")  # 09:30 EST
 
@@ -106,7 +106,7 @@ class TestStampFormat:
     def test_intraday_keeps_the_clock(self):
         """Unchanged, and asserted because a daily feature can pass by breaking this."""
         with resolution("1m"):
-            assert stamp_label(OPEN_ET) == "2026-09-03 13:30"
+            assert stamp_label(OPEN_ET) == "September 3, 2026 13:30"
 
     def test_no_daily_label_carries_a_colon(self):
         """The whole defect, as one assertion.
@@ -129,13 +129,13 @@ class TestStampFormat:
         """
         midnight_utc = pd.Timestamp("2026-09-03 00:00:00", tz="UTC")  # 20:00 ET, the day before
         with resolution("1d"):
-            assert stamp_label(midnight_utc) == "2026-09-02"
+            assert stamp_label(midnight_utc) == "September 2, 2026"
 
     def test_it_survives_both_daylight_saving_offsets(self):
         """09:30 EDT is 13:30 UTC; 09:30 EST is 14:30 UTC.  Both land on their own day."""
         with resolution("1d"):
             assert stamp_label(OPEN_ET) == DAY
-            assert stamp_label(OPEN_EST) == "2026-01-05"
+            assert stamp_label(OPEN_EST) == "January 5, 2026"
 
     def test_a_missing_stamp_is_an_em_dash_not_a_crash(self):
         """The Panel tab has a live ``pd.isna`` guard on this path; keep it total."""
@@ -153,7 +153,7 @@ class TestStampFormat:
         Asserted through the keyword because this is the only way the two can differ.
         """
         assert stamp_label(OPEN_ET, key="1d") == DAY
-        assert stamp_label(OPEN_ET, key="1m") == "2026-09-03 13:30"
+        assert stamp_label(OPEN_ET, key="1m") == "September 3, 2026 13:30"
 
 
 class TestZoneClaim:
@@ -187,10 +187,10 @@ class TestZoneClaim:
 class TestStampSpan:
     def test_it_is_the_arrow_pair_the_captions_open_with(self):
         with resolution("1d"):
-            assert stamp_span(OPEN_ET, OPEN_EST) == "2026-09-03 → 2026-01-05"
+            assert stamp_span(OPEN_ET, OPEN_EST) == "September 3, 2026 → January 5, 2026"
         with resolution("1m"):
             assert stamp_span(OPEN_ET, OPEN_EST) == \
-                "2026-09-03 13:30 → 2026-01-05 14:30"
+                "September 3, 2026 13:30 → January 5, 2026 14:30"
 
 
 class TestOneDefinition:
@@ -240,7 +240,7 @@ class TestPriceChartAxis:
         frame's first date, would also pass the colon test above.
         """
         pipe = Pipeline.from_frame(daily_bars(400, seed=7), length=60, timeframe="1d")
-        sessions = {str(s)[:10] for s in pipe.bars["timestamp"]}
+        sessions = {store_stamp_label(s, "1d") for s in pipe.bars["timestamp"]}
         for text in _labels(daily_fig):
             assert text in sessions, "%r is not a date in the archive" % text
 
@@ -406,7 +406,7 @@ class TestFetchSummary:
         from timeseries.timeframes import get_timeframe
 
         line = self._result(get_timeframe("1d"), OPEN_ET, OPEN_EST).summary()
-        assert "2026-09-03" in line and "2026-01-05" in line, line
+        assert "September 3, 2026" in line and "January 5, 2026" in line, line
         assert "(UTC)" not in line, line
         # Two stamps, so the arrow between them must survive.
         assert "→" in line, line
@@ -415,5 +415,5 @@ class TestFetchSummary:
         from timeseries.timeframes import get_timeframe
 
         line = self._result(get_timeframe("1m"), OPEN_ET, OPEN_EST).summary()
-        assert "2026-09-03 13:30" in line, line
+        assert "September 3, 2026 13:30" in line, line
         assert "(UTC)" in line, line

@@ -328,12 +328,12 @@ def stamp_labels(timestamps: Any, *, key: object = None) -> List[str]:
         # stamped at the Eastern open, and any other hour of the same session is
         # the same date.  ``session_et`` is the one definition of that date, so it
         # is what this calls.
-        dates = session_et(series).dt.strftime("%Y-%m-%d")
+        dates = session_et(series).dt.strftime("%B %-d, %Y")
     else:
         # Intraday: the bar's own instant, converted into the reader's zone.
         # ``tz_convert`` on a UTC series is the same conversion :func:`stamp_label`
         # performs on a single bar.
-        dates = series.dt.tz_convert(zone).dt.strftime("%Y-%m-%d %H:%M")
+        dates = series.dt.tz_convert(zone).dt.strftime("%B %-d, %Y %H:%M")
 
     labels = [str(v) for v in dates]
     # ``NaT`` stringifies to ``"nan"``; :func:`stamp_label` prints ``"—"`` for a
@@ -517,6 +517,8 @@ def active_projection_bounds() -> tuple:
     floor is a chart-drawing rule and the ceiling is a correction's premise.
     """
     tf = _tf()
+    if tf.key == "1d":
+        return 50, 500
     low = max(1, FORECAST_MIN_PROJECTION_BARS)
     # ``bars_per_session`` is 1 on daily, where it means "one bar is one session" --
     # so it is not a horizon ceiling and must not be read as one.
@@ -1204,7 +1206,13 @@ DEFAULT_VIEW_DAYS = 5
 # fall out of tuple order.  Streamlit falls back to the first tab when ``default`` is
 # ``None``, which means a reordering of ``TAB_ORDER`` would silently change the
 # landing view and break that promise with nothing in the diff to explain it.
-DEFAULT_TAB = "Live"
+def get_default_tab() -> str:
+    """The tab the page opens on, passed to ``st.tabs(default=...)``.
+
+    Defaults to "Projection" on daily resolution and "Live" on intraday.
+    """
+    return "Projection" if _tf().key == "1d" else "Live"
+
 
 # ``st.tabs`` only *registers a widget* -- and only reads its selection from
 # ``session_state`` -- when ``on_change`` is passed (Streamlit sets
@@ -1827,143 +1835,6 @@ def guide(key: str) -> None:
         return
     with st.expander("How to use this tab", icon=HELP_ICON):
         st.markdown(fill_tokens(text))
-
-
-HELP_DIALOG_TITLE = "How to use this app"
-
-
-@st.dialog(HELP_DIALOG_TITLE, width="large")
-def help_dialog() -> None:
-    """The full operator manual, reachable from anywhere in the app."""
-    st.markdown(fill_tokens(
-        "This app searches a [[SYMBOL]] [[TIMEFRAME]] archive for historical windows "
-        "shaped like a window you pick, then measures what happened after each of "
-        "those windows.\n\n"
-        "It is built to be hard to fool. Three rules are load-bearing and are visible "
-        "everywhere in the interface:"
-    ))
-    st.markdown(fill_tokens(
-        "1. **A forecast is never shown without its random-window baseline beside "
-        "it.** If the matched average does not beat the same statistic over randomly "
-        "chosen windows, it is not a forecast.\n"
-        "2. **A forecast is suppressed entirely when the sample cannot support it** "
-        "— fewer than *Min matches for evidence* valid windows. No number is printed, "
-        "not even greyed out.\n"
-        "3. **A query is exactly the window you drew.** The matcher compares your span "
-        "against windows of the same length, and the forward returns, the baseline and "
-        "the bootstrap all use that same length — so a number on the Forecast tab "
-        "always describes the window shown on the chart."
-    ))
-
-    st.divider()
-    st.markdown("#### The workflow")
-    st.markdown(fill_tokens(
-        ""| # | Tab | What you do there |\n"
-        "|---|---|---|\n"
-        "| 1 | **Price** | The tape. Your query on top, its closest match anywhere in "
-        "the S&P 500 archive below, and the only control that picks a window — brush "
-        "it. This is where the app opens |\n"
-        "| 2 | **Matches** | The same question asked of *this ticker's own* history: "
-        "every window that traces the same shape, and how unusual that is |\n"
-        "| 3 | **Projection** | A fixed reference: where the archive's own most recent bars "
-        "usually went next, answered the same way every time. Takes no reader input, "
-        "and carries the **Projection bars** control both projections share |\n"
-        "| 4 | **Forecast** | Read what followed a window **you** drew, always against a "
-        "random-window baseline. It has its **own ticker input** at the top of the "
-        "tab, so it can forecast a different company than the tape on *Price* |\n"
-        "| 5 | **Progression** | The same question asked at fifty lookbacks: what "
-        "usually followed this tape, and does the answer change with how much history "
-        "you look back? All fifty projections are drawn on one chart |\n"
-        "| 6 | **Panel** | A cross-sectional search you drive yourself — pick the "
-        "ticker and window, then see every analogue in the index with three ranks |\n"
-        "| 7 | **Quality** | Confirm the underlying bars are sound |\n"
-        "| 8 | **Backtest** | Test out-of-sample whether any of it beats a coin flip |\n\n"
-        "A 60-second tour:\n\n"
-        "1. Leave the ticker boxes at their defaults — the app opens on the newest window, "
-        "over the last five trading sessions. Both boxes sit at the **top of the "
-        "page**; **Forecast** starts on the same ticker, and gives it a different one "
-        "whenever you want to compare two companies.\n"
-        "2. Press **Run match** on the tab you are reading.\n"
-        "3. Open **Matches**. Read the *percentile* column, not the distance column.\n"
-        "4. Open **Forecast**, brush a window, and compare the green bar to the grey "
-        "bar. If the row is grey, no evidence exists — raise **k matches**.\n"
-        "5. Open **Backtest** and press **Run backtest** for the honest verdict.\n\n"
-        "To search an earlier moment: drag a box across the top chart on the *Price* "
-        "tab. A brush of N bars is searched as N bars, and Matches and Forecast update "
-        "on the same click.\n\n"
-        "**Two different searches, deliberately.** *Price* asks the wide question — "
-        "\"has anything in the index done this?\" — so its match is usually a different "
-        "company, and the caption says which. *Matches* and *Forecast* ask the narrow "
-        "one, about the fetched symbol's own history, because a forecast is only "
-        "meaningful against a control drawn from the same instrument. *Projection* asks "
-        "neither — it is the archive answering about itself. Use *Panel* when you want "
-        "the wide question with a forecast attached to it."
-    ))
-
-    st.divider()
-    st.markdown("#### Every sidebar control")
-    st.markdown(fill_tokens(CONTROL_GLOSSARY))
-
-    st.divider()
-    st.markdown("#### Glossary")
-    st.markdown(fill_tokens(GLOSSARY))
-
-    st.divider()
-    st.markdown("#### Common questions")
-    st.markdown(
-        "**“The Forecast tab is all grey — what do I do?”**\n"
-        "The matched set did not reach *Min matches for evidence*. In order of cost: "
-        "raise **k matches** to ≥ 30, or move the query away from the end of the archive "
-        "so more windows have a full forward horizon.\n\n"
-        "**“Why does the percentile change when I move the query?”**\n"
-        "The percentile is measured against every candidate window in the archive, so a "
-        "query sitting in a quiet stretch competes against a different field of windows "
-        "than one in a busy stretch. The *absolute* percentile matters more than the "
-        "count of matches.\n\n"
-        "**“Where do the numbers come from?”**\n"
-        "Everything on every tab comes from `src/timeseries/`. The `§` references point "
-        "into `PLAN.md`, which records the design rationale and each bug this project "
-        "has already fixed (§Z1 forward returns from the wrong bar, §Z2 infinite "
-        "volume changes, §BD removing a time-warped metric whose percentile could not be "
-        "ranked).\n\n"
-        "**“Is this trading advice?”**\n"
-        "No. It is exploratory research tooling on a single instrument's intraday "
-        "archive, with no position sizing, no execution, and no claim of edge."
-    )
-
-    st.divider()
-    st.markdown("#### How the numbers are produced")
-    st.markdown(
-        "* **Features.** Two legs per bar, both price: `return_z`, a rolling-20 z-score of "
-        "the log return, and `path_z`, the rebased log-price path itself — the line "
-        "the chart draws. Z-scoring both is what keeps the rolling return and the "
-        "drawn path on one scale.\n"
-        "* **Warm-up.** The first ~20 bars cannot have a rolling standard deviation, so "
-        "they are dropped rather than imputed. All bar indices are into this cleaned "
-        "frame.\n"
-        "* **The funnel.** A STUMPY matrix-profile scan scores every candidate window in "
-        "one compiled pass, then exclusion and suppression separate genuine matches "
-        "from the query's own neighbourhood (§C, §M).\n"
-        "* **Self-match guard.** Every window overlapping the query, plus one "
-        "window-length of margin, is removed before scoring (§M).\n"
-        "* **Forward returns.** Measured from the **last bar of the matched window** "
-        "forward — never from inside it (§Z1).\n"
-        "* **Uncertainty.** Moving-block bootstrap for intervals (matched windows "
-        "overlap in time) and a permutation test against the random baseline for "
-        "p-values.\n\n"
-        "**Is the harness itself trustworthy?** Run the placebo test — it feeds "
-        "synthetic random-walk data of the same volatility through the whole pipeline "
-        "and must find nothing:\n\n"
-        "```\n"
-        "python3 -m timeseries.placebo\n"
-        "```\n\n"
-        "If it reports significant patterns, the bug is in the measurement, not the "
-        "market. This is the single highest-value check in the project (§E) and takes "
-        "well under a minute, so run it before trusting anything on the Forecast or "
-        "Backtest tabs.\n\n"
-        "**Not trading advice.** This is exploratory research tooling built on a single "
-        "instrument's intraday archive."
-    )
 
 
 CONTROL_GLOSSARY = """
@@ -3995,12 +3866,10 @@ def build_forecast_path_figure(
     bar the projection grows out of; ``projection_anchor + offsets`` are the
     projection's x-positions, computed once and never moved.
 
-    **The separator stands on the first bar that belongs to the projection alone.**
-    That bar is ``projection_anchor + 1``.  Offset 0 *is* the anchor -- the bar
-    history and forecast share -- so the first bar that exists only in the
-    projection is the one after it.  The line therefore marks where the
-    projected bars *begin*, rather than pointing at the real bar they grow out
-    of.  The projection's trace still starts at the anchor, because that is the
+    **The separator stands where the projection bars start.**  That bar is
+    ``projection_anchor`` -- offset 0 of the forecast path, which is the first
+    projected bar.  The line therefore marks where the projected bars *begin*.
+    The projection's trace still starts at the anchor, because that is the
     contract :func:`timeseries.forecast.forecast_paths` states: the two halves
     meet at one point rather than at two points a bar apart.
 
@@ -4074,10 +3943,10 @@ def build_forecast_path_figure(
         anchor = int(projection_anchor)
     stop = projection_anchor + int(path.horizon)
 
-    # **The separator stands on the first bar that belongs to the projection
-    # alone.**  That bar is ``anchor + 1`` -- see the docstring for why, and for
-    # why the projection's *trace* still starts on the anchor.
-    boundary = anchor + 1
+    # **The separator stands where the projection bars start.**  That bar is
+    # ``anchor`` -- offset 0 of the forecast path -- see the docstring for why,
+    # and for why the projection's *trace* still starts on the anchor.
+    boundary = anchor
 
     close = np.asarray(pipe.close, dtype=float)
     base = float(close[anchor]) if 0 <= anchor < n else float("nan")
@@ -4133,8 +4002,23 @@ def build_forecast_path_figure(
         name="interquartile range",
     ))
     # Offset labels for the projection: those bars do not exist yet, so the
-    # hover prints "+4 min" / "+4 days" rather than a clock time.
-    proj_stamps = ["+%d %s" % (o, bar_unit(o)) for o in path.offsets]
+    # hover prints the projected date rather than a bare offset.
+    anchor_ts = pd.Timestamp(pipe.bars["timestamp"].iloc[projection_anchor])
+    if _tf().key == "1m":
+        # Intraday: one bar is one minute, so the offset in bars is the offset
+        # in minutes. Print the projected clock time in the reader's zone.
+        zone = display_zone()
+        proj_stamps = [
+            (anchor_ts + pd.Timedelta(minutes=int(o))).tz_convert(zone).strftime("%B %-d, %Y %H:%M")
+            for o in path.offsets
+        ]
+    else:
+        # Daily: one bar per session, so an offset is a session count. Print
+        # the projected date (Eastern) rather than "+4 days".
+        proj_stamps = [
+            (anchor_ts + pd.Timedelta(days=int(o))).strftime("%B %-d, %Y")
+            for o in path.offsets
+        ]
     if show_median:
         fig.add_trace(go.Scatter(
             x=proj_x, y=y_median, mode="lines",
@@ -4200,9 +4084,9 @@ def build_forecast_path_figure(
 
     # The boundary, drawn before the shading so the shading does not wash it out.
     #
-    # **The line is on the first *projected* bar**, ``anchor + 1``, and it is on the
-    # *pinned* anchor's successor, so it holds still as the tape rolls.  It used to
-    # be drawn at the history's last bar, which on the *Live* tab is the archive's
+    # **The line is where the projection bars start**, ``anchor`` -- offset 0 of
+    # the forecast path -- so it holds still as the tape rolls.  It used to be
+    # drawn at the history's last bar, which on the *Live* tab is the archive's
     # newest bar -- so the line walked right with the tape and stopped meaning
     # anything.
     fig.add_vline(x=boundary, line=dict(color="rgba(128,128,128,0.9)", width=1.4,
@@ -4238,21 +4122,14 @@ def build_forecast_path_figure(
     # does not.  Either way the boundary is named once, and never twice.
     anchor_tick = projection_anchor
     history_labels_anchor = anchor_tick in ticks
-    # **Offset 0 is dropped either way.**  It sits on the anchor bar, which is
-    # always labelled -- by the history's own ticks when the history ends at
-    # the anchor, and by an explicit tick when the anchor sits *inside* a
-    # history that runs on past it (the *Live* tab, whose tape keeps rolling to
-    # the right of the frozen anchor).  Keeping offset 0 in the second case
-    # put the anchor on the axis twice, under two different spellings: the
+    # **Offset 0 is the boundary.**  It sits on the anchor bar, which is always
+    # labelled -- by the history's own ticks when the history ends at the
+    # anchor, and by an explicit tick when the anchor sits *inside* a history
+    # that runs on past it (the *Live* tab, whose tape keeps rolling to the
+    # right of the frozen anchor).  Keeping offset 0 in the second case put
+    # the anchor on the axis twice, under two different spellings: the
     # history's full timestamp and the projection's bare clock time.
     proj_offsets = [o for o in proj_ticks if o != 0]
-    # **Offset 1 is the boundary, and the boundary is always labelled.**  The
-    # tick step can skip over it -- a horizon of 20 with a step of 4 goes
-    # 0, 4, 8 ... and never names the bar the separator stands on -- so offset
-    # 1 is put back in.  An unlabelled separator is a boundary the reader
-    # cannot place, and this one is the whole point of the chart.
-    if int(path.horizon) >= 1 and 1 not in proj_offsets:
-        proj_offsets = sorted(proj_offsets + [1])
 
     # **The unit is the resolution's, not a literal.**  These offsets are *bars*, so
     # on daily a tick reads "+4 days", not "+4 min" -- one bar is one trading day there.
@@ -4267,7 +4144,6 @@ def build_forecast_path_figure(
     # was handed, not the ones the page opened on.  The *history* labels therefore come
     # from the pipeline, which is the authority on the bars actually drawn; only the
     # projected offsets, which have no pipeline behind them, use the active timeframe.
-    anchor_ts = pd.Timestamp(pipe.bars["timestamp"].iloc[projection_anchor])
 
     # **The tick values and their labels are built together**, so the two lists
     # cannot drift apart: a label is only ever emitted for a position that was
@@ -4716,7 +4592,7 @@ def render_live_tab(pipe: Pipeline, symbol: str, *,
     projection_bars = st.slider(
         "Projection bars",
         min_value=10, max_value=600,
-        step=50, value=10,
+        step=50, value=40,
         help="How many bars into the future to project the historical match.",
         key="live_projection_bars_slider",
     )
@@ -6161,7 +6037,8 @@ def _render_projection_control(horizon: Optional[int]) -> int:
 
     return int(st.slider(
         "Projection bars",
-        min_value=low, max_value=int(high), value=value, step=1,
+        min_value=low, max_value=int(high), value=value,
+        step=50 if _tf().key == "1d" else 1,
         key=forecast_horizon_key(),
         help="How many bars past the window to project. This is the length of the "
              "green band on all three charts on this tab — it changes how far ahead "
@@ -6860,8 +6737,8 @@ def render_archive_sync() -> None:
         # The frontier is the date **most** tickers have reached, and it is the
         # number that answers "can I trust this archive?".
         frontier = status["frontier"]
-        newest = status["newest"].strftime("%d %b %Y") if status["newest"] else "—"
-        frontier_txt = frontier.strftime("%d %b %Y") if frontier else "—"
+        newest = status["newest"].strftime("%B %-d, %Y") if status["newest"] else "—"
+        frontier_txt = frontier.strftime("%B %-d, %Y") if frontier else "—"
 
         # The age is counted in **trading sessions**, because the archive is
         # measured in sessions.  A calendar-day count made a Friday archive look
@@ -8109,6 +7986,62 @@ FETCH_SCOPES: Dict[str, Dict[str, str]] = {
             "in progress."
         ),
     },
+    "price": {
+        "widget_label": "Ticker symbol",
+        "button_label": "Fetch",
+        "help": (
+            "Any ticker Yahoo Finance accepts. Press **Fetch** to download its bars at "
+            "the chosen resolution and redraw every tab on the page. Nothing is "
+            "written to `data/` — the bars live in memory for this session only.\n\n"
+            "The app opens on **{}**, so there is something on screen before you touch "
+            "anything. Type any other symbol and press **Fetch** to switch.\n\n"
+            "**Resolution is chosen once, when the app opens** — it is shown "
+            "beside this box and is not a control here. 1-minute gives ~29 days "
+            "of intraday tape; Daily gives the whole listing history, a far "
+            "larger archive to match over and a very different question. To "
+            "change it, reload the page and choose again.\n\n"
+            "**One ticker, one page.** Every tab — Price, Matches, Projection, "
+            "Forecast, Quality and Backtest — is built from the same bars, so a "
+            "forecast is always a forecast of the instrument you are looking at. "
+            "There is no second box to point at another name.\n\n"
+            "Class shares are typed with a dash (`BRK-B`); it is converted for you."
+            "\n\nYahoo index symbols take a leading `^` — `^VIX` for the CBOE "
+            "Volatility Index, `^GSPC` for the S&P 500, `^DJI` for the Dow."
+        ),
+        "downloaded": (
+            "Downloading every {2} bar Yahoo has for {1} and redrawing every tab "
+            "on the page. Press it again to pick up bars from the session still "
+            "in progress."
+        ),
+    },
+    "forecast": {
+        "widget_label": "Ticker symbol",
+        "button_label": "Fetch",
+        "help": (
+            "Any ticker Yahoo Finance accepts. Press **Fetch** to download its bars at "
+            "the chosen resolution and redraw every tab on the page. Nothing is "
+            "written to `data/` — the bars live in memory for this session only.\n\n"
+            "The app opens on **{}**, so there is something on screen before you touch "
+            "anything. Type any other symbol and press **Fetch** to switch.\n\n"
+            "**Resolution is chosen once, when the app opens** — it is shown "
+            "beside this box and is not a control here. 1-minute gives ~29 days "
+            "of intraday tape; Daily gives the whole listing history, a far "
+            "larger archive to match over and a very different question. To "
+            "change it, reload the page and choose again.\n\n"
+            "**One ticker, one page.** Every tab — Price, Matches, Projection, "
+            "Forecast, Quality and Backtest — is built from the same bars, so a "
+            "forecast is always a forecast of the instrument you are looking at. "
+            "There is no second box to point at another name.\n\n"
+            "Class shares are typed with a dash (`BRK-B`); it is converted for you."
+            "\n\nYahoo index symbols take a leading `^` — `^VIX` for the CBOE "
+            "Volatility Index, `^GSPC` for the S&P 500, `^DJI` for the Dow."
+        ),
+        "downloaded": (
+            "Downloading every {2} bar Yahoo has for {1} and redrawing every tab "
+            "on the page. Press it again to pick up bars from the session still "
+            "in progress."
+        ),
+    },
 
 }
 
@@ -8567,8 +8500,7 @@ def render_sidebar() -> Dict[str, Any]:
 
     The help here is deliberately *attached to the control it describes* rather than
     collected in one page: the question "what does this slider do?" is only ever asked
-    while the slider is on screen.  The long-form manual is one click away via the
-    :func:`help_dialog` button at the top of this sidebar.
+    while the slider is on screen.
     """
     with st.sidebar:
 
@@ -8602,11 +8534,6 @@ def render_sidebar() -> Dict[str, Any]:
 
         # Ticker input for the whole session.
         render_ticker_input("app")
-
-        if st.button(HELP_ICON + "  How to use this app", width='stretch',
-                     help="Full manual: the workflow, every control, and a "
-                          "glossary of every term and metric."):
-            help_dialog()
 
         st.divider()
 
@@ -8993,12 +8920,6 @@ def main() -> None:
         )
     with button_col:
         st.markdown('<div style="height:1.5rem"></div>', unsafe_allow_html=True)
-        if st.button(HELP_ICON + "  How to use this app", width='stretch',
-                     type="primary",
-                     help="Full manual: the workflow, every control, and a "
-                          "glossary of every metric shown on any tab."):
-            help_dialog()
-
     st.caption(
         "Source: **{}** fetched live from Yahoo Finance — not written to "
         "`data/`, so it lives only for this session.  ·  Every tab — Price, "
@@ -9013,7 +8934,25 @@ def main() -> None:
             # ``symbol`` alone would let a daily pipeline be served under the entry
             # built from 1-minute bars, which is the same silent collision the fetch
             # cache is keyed to avoid.
-            bars = fetch_ticker_cached(symbol, timeframe=tf.key).frame
+            #
+            # On a fresh Streamlit start the in-memory fetch store is empty, so
+            # ``fetch_ticker_cached`` always re-downloads from yfinance even when the
+            # partitioned Parquet archive on disk already holds bars from earlier
+            # loads.  Read the archive first so "bars loaded" reflects everything we
+            # have, not just what yfinance returned this session.
+            archive_root = panel_root_for(tf.key)
+            bars = None
+            if os.path.isdir(archive_root):
+                try:
+                    archived = PanelStore(archive_root).load(
+                        tickers=[symbol],
+                    )
+                    if not archived.empty:
+                        bars = archived[archived["ticker"] == symbol].copy()
+                except Exception:  # noqa: BLE001 - fall through to a fresh fetch
+                    bars = None
+            if bars is None or bars.empty:
+                bars = fetch_ticker_cached(symbol, timeframe=tf.key).frame
             pipe = pipeline_from_frame(
                 "{}@{}".format(symbol, tf.key), bars, active_length(), timeframe=tf
             )
@@ -9148,7 +9087,7 @@ def main() -> None:
             "candidates behind it yields a meaningless percentile either way.".format(
                 pipe.n_bars)
         )
-        tabs = st.tabs(list(TAB_ORDER), default=DEFAULT_TAB, key=tabs_key())
+        tabs = st.tabs(list(TAB_ORDER), default=get_default_tab(), key=tabs_key())
         with tabs[TAB_ORDER.index("Quality")]:
             render_quality_tab(pipe)
         with tabs[TAB_ORDER.index("Price")]:
@@ -9369,9 +9308,7 @@ def main() -> None:
     # The onboarding tour used to render here, above the tab bar, so it appeared on
     # every tab.  It was then moved into the *Chart* tab body -- and went with that tab.
     # ``render_onboarding`` and the "New here? Start with the 60-second tour" expander
-    # that hosted it are gone; the full manual is still one click away from any tab via
-    # the **How to use this app** button in the page header, which is where a
-    # first-time reader is pointed now.
+    # that hosted it are gone.
 
     # ---------------- Tabs --------------------------------------------------- #
     # ``default=DEFAULT_TAB`` opens the page on Projection -- the fixed reference.
@@ -9381,7 +9318,7 @@ def main() -> None:
     # *Projection*: ``reset_query_state`` bumps the generation, a new key is a new block
     # id, and a new block id is the one situation in which ``default`` is honoured.
     # See ``TABS_KEY``.
-    tabs = st.tabs(list(TAB_ORDER), default=DEFAULT_TAB, key=tabs_key())
+    tabs = st.tabs(list(TAB_ORDER), default=get_default_tab(), key=tabs_key())
 
     # Unpacked by *name* rather than positionally.  ``TAB_ORDER`` had gained "Panel"
     # without the positional six-way unpack below being updated, which raised

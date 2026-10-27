@@ -4,7 +4,7 @@ stumpy>=1.13.0
 
 [app]
 yfinance>=0.2.36
-streamlit>=1.28.0
+streamlit>=1.56.0
 plotly>=5.18.0
 
 [dev]

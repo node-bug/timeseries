@@ -168,7 +168,7 @@ def session_et(ts: pd.Series) -> pd.Series:
 def stamp_label(ts: object, tf: object = None, *, zone: object = None) -> str:
     """One bar's stamp as a reader should read it, at this bar's resolution.
 
-    ``2026-09-03 09:30`` intraday, ``2026-09-03`` daily.  **One definition, because
+    ``September 3, 2026 09:30`` intraday, ``September 3, 2026`` daily.  **One definition, because
     ``fetch.py``'s summary line and the app's chart axes must not be able to disagree**
     about what a bar looks like -- a reader comparing the one is exactly how a
     resolution mismatch gets noticed, and only if the two are printed the same way.
@@ -199,10 +199,10 @@ def stamp_label(ts: object, tf: object = None, *, zone: object = None) -> str:
     if pd.isna(stamp):
         return "—"
     if tf.bars_per_session == 1:
-        return session_et(pd.Series([stamp])).iloc[0].strftime("%Y-%m-%d")
+        return session_et(pd.Series([stamp])).iloc[0].strftime("%B %-d, %Y")
     if zone is not None:
         stamp = stamp.tz_convert(zone)
-    return stamp.strftime("%Y-%m-%d %H:%M")
+    return stamp.strftime("%B %-d, %Y %H:%M")
 
 
 def session_bounds(day: date) -> tuple[datetime, datetime]:
